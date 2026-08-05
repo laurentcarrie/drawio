@@ -1,8 +1,21 @@
 <mxfile host="Electron">
   <diagram name="Page-1" id="p8v677IgeAn1WNNbPrRx">
-    <mxGraphModel dx="1414" dy="876" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+    <mxGraphModel dx="1664" dy="2200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
       <root>
         <mxCell id="0" />
+        <mxCell id="KRWsN7CQw0dpqJ6ey3AX-7" parent="0" value="cadre" />
+        <mxCell id="KRWsN7CQw0dpqJ6ey3AX-8" parent="KRWsN7CQw0dpqJ6ey3AX-7" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=none;" value="" vertex="1">
+          <mxGeometry height="550" width="700" x="60" y="-40" as="geometry" />
+        </mxCell>
+        <mxCell id="KRWsN7CQw0dpqJ6ey3AX-9" parent="KRWsN7CQw0dpqJ6ey3AX-7" style="text;html=1;whiteSpace=wrap;overflow=hidden;rounded=0;" value="&lt;h1 style=&quot;margin-top: 0px;&quot;&gt;Heading&lt;/h1&gt;&lt;p&gt;Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.&lt;/p&gt;" vertex="1">
+          <mxGeometry height="120" width="180" x="300" y="180" as="geometry" />
+        </mxCell>
+        <mxCell id="KRWsN7CQw0dpqJ6ey3AX-10" parent="KRWsN7CQw0dpqJ6ey3AX-7" style="text;html=1;whiteSpace=wrap;overflow=hidden;rounded=0;" value="&lt;h1 style=&quot;margin-top: 0px;&quot;&gt;Heading&lt;/h1&gt;&lt;p&gt;Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.&lt;/p&gt;" vertex="1">
+          <mxGeometry height="120" width="180" x="300" y="180" as="geometry" />
+        </mxCell>
+        <mxCell id="KRWsN7CQw0dpqJ6ey3AX-11" parent="KRWsN7CQw0dpqJ6ey3AX-7" style="text;html=1;whiteSpace=wrap;overflow=hidden;rounded=0;" value="&lt;h1 style=&quot;margin-top: 0px;&quot;&gt;Système réel&lt;/h1&gt;" vertex="1">
+          <mxGeometry height="120" width="180" x="60" y="20" as="geometry" />
+        </mxCell>
         <mxCell id="1" parent="0" value="origine" />
         <mxCell id="iq7qwQ3zTcZndBoYMNhC-14" parent="1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFD966;" value="" vertex="1">
           <mxGeometry height="400" width="320" x="240" y="80" as="geometry" />
