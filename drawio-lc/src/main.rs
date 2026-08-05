@@ -1,14 +1,16 @@
+mod confluence_export;
 mod gif_export;
+mod html_export;
 mod model;
 mod transform;
 
-use std::{collections::HashSet, env, fs, path::Path, process};
+use std::{collections::HashMap, env, fs, path::Path, process};
 
 use image::GenericImageView;
 use model::Config;
 
 fn validate_config(config: &Config) {
-    let mut available: HashSet<&str> = HashSet::new();
+    let mut available: std::collections::HashSet<&str> = std::collections::HashSet::new();
     available.insert(&config.original);
 
     for (i, derived) in config.derived.iter().enumerate() {
@@ -71,22 +73,41 @@ fn main() {
         process::exit(1);
     });
 
-    for derived in &config.derived {
-        let from_xml = if derived.from == config.original {
-            input_xml.clone()
-        } else {
-            fs::read_to_string(&derived.from).unwrap_or_else(|e| {
-                eprintln!("Error reading {}: {}", derived.from, e);
-                process::exit(1);
-            })
-        };
+    // Keep transformed XML in memory keyed by the logical output name so
+    // chained steps never need to read back from disk.
+    let mut xml_cache: HashMap<String, String> = HashMap::new();
+    xml_cache.insert(config.original.clone(), input_xml);
 
-        transform::transform(&from_xml, derived, Some(ref_size)).unwrap_or_else(|e| {
-            eprintln!("Error transforming into {}: {}", derived.output, e);
+    // Use a temp directory for intermediate .drawio files; only PNGs are kept.
+    let tmp_dir = std::env::temp_dir().join("drawio-lc");
+    fs::create_dir_all(&tmp_dir).unwrap_or_else(|e| {
+        eprintln!("Error creating temp dir: {}", e);
+        process::exit(1);
+    });
+
+    for derived in &config.derived {
+        let from_xml = xml_cache.get(&derived.from).unwrap_or_else(|| {
+            eprintln!("Internal error: XML for '{}' not in cache", derived.from);
             process::exit(1);
         });
 
-        println!("Generated {}", derived.output);
+        // Temp .drawio file lives in /tmp/drawio-lc/; PNG goes next to test.yaml.
+        let stem = Path::new(&derived.output)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let tmp_drawio = tmp_dir.join(format!("{}.drawio", stem));
+        let png_path = Path::new(&derived.output).with_extension("png");
+
+        let out_xml = transform::transform(from_xml, derived, &tmp_drawio, &png_path, Some(ref_size))
+            .unwrap_or_else(|e| {
+                eprintln!("Error transforming into {}: {}", derived.output, e);
+                process::exit(1);
+            });
+
+        xml_cache.insert(derived.output.clone(), out_xml);
+        println!("Generated {}", png_path.display());
     }
 
     // Build animated GIF from all generated PNGs in step order.
@@ -111,6 +132,22 @@ fn main() {
         process::exit(1);
     });
     println!("Generated {}", mp4_path.display());
+
+    // Build self-contained HTML slideshow (Prev/Next buttons, keyboard navigation).
+    let html_path = Path::new(&config.original).with_extension("html");
+    html_export::build_html_slideshow(&png_path_refs, &html_path).unwrap_or_else(|e| {
+        eprintln!("Error building HTML slideshow: {}", e);
+        process::exit(1);
+    });
+    println!("Generated {}", html_path.display());
+
+    // Optionally push slides to Confluence if configured.
+    if let Some(ref cf) = config.confluence {
+        confluence_export::push_to_confluence(&png_path_refs, cf).unwrap_or_else(|e| {
+            eprintln!("Error pushing to Confluence: {}", e);
+            process::exit(1);
+        });
+    }
 }
 
 fn export_mp4(gif_path: &Path, mp4_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
