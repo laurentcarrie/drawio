@@ -4,6 +4,21 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub original: String,
     pub derived: Vec<Derived>,
+    /// Optional: if present, the generated slides are pushed to Confluence.
+    pub confluence: Option<ConfluenceConfig>,
+}
+
+/// Confluence Cloud target.
+/// Authentication is read from the `CONFLUENCE_USER` and `CONFLUENCE_TOKEN`
+/// environment variables (user = Atlassian account email, token = API token).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConfluenceConfig {
+    /// Base URL of your Confluence Cloud instance, e.g. https://mycompany.atlassian.net
+    pub url: String,
+    /// Space key, e.g. "TEAM"
+    pub space_key: String,
+    /// Title of the page to create or update.
+    pub page_title: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

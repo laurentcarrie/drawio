@@ -1,11 +1,15 @@
 use std::{fs::File, path::Path};
 
 use gif::{Encoder, Frame, Repeat};
-use image::{imageops::FilterType, DynamicImage, GenericImageView};
+use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba, RgbaImage};
 
 /// Build an animated GIF from a list of PNG paths.
 /// The GIF is written to `output_path`.
 /// Each frame is displayed for `delay_ms` milliseconds (rounded to centiseconds).
+///
+/// All frames are placed on a white canvas sized to the maximum width and
+/// height across all input PNGs. Frames smaller than the canvas are centred
+/// rather than stretched, so aspect ratios are always preserved.
 pub fn build_animated_gif(
     png_paths: &[&Path],
     output_path: &Path,
@@ -21,9 +25,10 @@ pub fn build_animated_gif(
         .map(|p| image::open(p).map_err(|e| format!("Failed to load {}: {}", p.display(), e)))
         .collect::<Result<_, _>>()?;
 
-    // Use the dimensions of the first frame as the canvas size;
-    // resize others to match if they differ.
-    let (width, height) = images[0].dimensions();
+    // Use the maximum width and height across all frames so no frame needs to
+    // be stretched (smaller frames are centred on a white background).
+    let width = images.iter().map(|i| i.dimensions().0).max().unwrap();
+    let height = images.iter().map(|i| i.dimensions().1).max().unwrap();
 
     let output_file = File::create(output_path)?;
     let mut encoder = Encoder::new(output_file, width as u16, height as u16, &[])?;
@@ -33,15 +38,22 @@ pub fn build_animated_gif(
     let delay_cs = (delay_ms / 10) as u16;
 
     for img in &images {
-        let img = if img.dimensions() != (width, height) {
-            img.resize_exact(width, height, FilterType::Lanczos3)
+        let (iw, ih) = img.dimensions();
+        let canvas: RgbaImage = if (iw, ih) == (width, height) {
+            img.to_rgba8()
         } else {
-            img.clone()
+            // Centre the frame on a white canvas without stretching.
+            let mut canvas: RgbaImage =
+                ImageBuffer::from_pixel(width, height, Rgba([255u8, 255, 255, 255]));
+            let x_off = (width - iw) / 2;
+            let y_off = (height - ih) / 2;
+            for (x, y, pixel) in img.to_rgba8().enumerate_pixels() {
+                canvas.put_pixel(x + x_off, y + y_off, *pixel);
+            }
+            canvas
         };
 
-        let rgba = img.to_rgba8();
-        let mut pixels = rgba.into_raw();
-
+        let mut pixels = canvas.into_raw();
         let mut frame = Frame::from_rgba_speed(width as u16, height as u16, &mut pixels, 10);
         frame.delay = delay_cs;
         encoder.write_frame(&frame)?;

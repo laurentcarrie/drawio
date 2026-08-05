@@ -1,6 +1,6 @@
 [package]
 name = "drawio-lc"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "CLI tool to apply transforms to draw.io diagrams and export them to PNG/GIF/MP4"
 license = "MIT OR Apache-2.0"
@@ -8,7 +8,10 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+serde_json = "1"
 quick-xml = { version = "0.37", features = ["serialize"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 gif = "0.13"
 pulldown-cmark = "0.12"
+ureq = { version = "2", features = ["native-tls", "json"] }
+native-tls = "0.2"

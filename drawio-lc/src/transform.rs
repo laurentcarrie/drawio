@@ -8,28 +8,40 @@ use quick_xml::{
 
 use crate::model::{Derived, Transform};
 
-/// Apply all transforms defined in `derived` to `input_xml` and write the
-/// result to `derived.output`.
+/// Apply transforms to `input_xml`, write the resulting drawio XML to
+/// `drawio_path` (a temp file), export it as a PNG to `png_path`, then
+/// delete the temporary drawio file.
+/// Returns the transformed XML so the caller can keep it in memory for
+/// chained steps.
 pub fn transform(
     input_xml: &str,
     derived: &Derived,
+    drawio_path: &Path,
+    png_path: &Path,
     ref_size: Option<(u32, u32)>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error>> {
     let xml = apply_transforms(input_xml, &derived.transforms, ref_size)?;
 
-    let output_path = Path::new(&derived.output);
-    if let Some(parent) = output_path.parent() {
+    if let Some(parent) = drawio_path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
 
-    let mut file = fs::File::create(output_path)?;
+    let mut file = fs::File::create(drawio_path)?;
     file.write_all(xml.as_bytes())?;
 
-    export_png(output_path, ref_size)?;
+    export_png(drawio_path, png_path, ref_size)?;
 
-    Ok(())
+    fs::remove_file(drawio_path).unwrap_or_else(|e| {
+        eprintln!(
+            "Warning: could not remove temp file {}: {}",
+            drawio_path.display(),
+            e
+        );
+    });
+
+    Ok(xml)
 }
 
 /// Export a drawio file to a specific PNG output path, with no size constraint.
@@ -65,10 +77,9 @@ pub fn export_reference_png(
 }
 
 /// Shell out to the draw.io CLI to export the given `.drawio` file as PNG.
-/// The PNG is written next to the drawio file with a `.png` extension.
+/// The PNG is written to `png_path`.
 /// If `size` is provided, `--width` and `--height` are passed to fix the canvas size.
-fn export_png(drawio_path: &Path, size: Option<(u32, u32)>) -> Result<(), Box<dyn std::error::Error>> {
-    let png_path = drawio_path.with_extension("png");
+fn export_png(drawio_path: &Path, png_path: &Path, size: Option<(u32, u32)>) -> Result<(), Box<dyn std::error::Error>> {
     let width_str;
     let height_str;
 
