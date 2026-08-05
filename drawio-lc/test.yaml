@@ -1,11 +1,50 @@
-original: ../test.drawio
+original: test.drawio
 derived:
-  - output: ../step1.drawio
-    from: ../test.drawio
+  # - output: step0.drawio
+  #   from: test.drawio
+  #   transforms:
+  #     - type: TitleSlide
+  #       text: |
+  #         # Benbi - un outil pour automatiser les tests
+
+  #         - système
+  #         - system under test (sut)
+  #         - mocks
+  #         - scenarios
+  #         - automatisation
+  #         - lgtm
+  #         - traçabilité exigences
+  #         - jira
+
+  - output: step1.drawio
+    from: test.drawio
     transforms:
+      - type: LayerVisibility
+        show: []
+        hide:
+          - sut
+
+  - output: step2.drawio
+    from: test.drawio
+    transforms:
+      - type: ReplaceText
+        id: KRWsN7CQw0dpqJ6ey3AX-11
+        text: "blah blah blah"
+      - type: LayerVisibility
+        show:
+          - sut
+        hide: []
       - type: Color
-        id: iq7qwQ3zTcZndBoYMNhC-1
+        ids:
+          - iq7qwQ3zTcZndBoYMNhC-1
+          - iq7qwQ3zTcZndBoYMNhC-2
         color: "#AE4132"
-      - type: Color
-        id: iq7qwQ3zTcZndBoYMNhC-2
-        color: "#AE4132"
+
+  - output: step3.drawio
+    from: step2.drawio
+    transforms:
+      - type: ColorEdges
+        exclude:
+          - iq7qwQ3zTcZndBoYMNhC-1
+          - iq7qwQ3zTcZndBoYMNhC-2
+        color: "#CCCCCC"
