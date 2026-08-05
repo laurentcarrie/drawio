@@ -1,9 +1,12 @@
 [package]
 name = "drawio-lc"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 quick-xml = { version = "0.37", features = ["serialize"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+gif = "0.13"
+pulldown-cmark = "0.12"
