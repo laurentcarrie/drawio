@@ -544,7 +544,7 @@ mod tests {
             show: vec![],
             hide: vec!["background".to_string()],
         }];
-        let result = apply_transforms(SAMPLE_XML, &transforms).unwrap();
+        let result = apply_transforms(SAMPLE_XML, &transforms, None).unwrap();
         assert!(result.contains(r#"value="background" visible="0""#) || result.contains(r#"visible="0""#));
         // foreground untouched — no visible attribute injected for it
         assert!(!result.contains(r#"value="foreground" visible="#));
@@ -556,7 +556,7 @@ mod tests {
             show: vec!["foreground".to_string()],
             hide: vec![],
         }];
-        let result = apply_transforms(SAMPLE_XML, &transforms).unwrap();
+        let result = apply_transforms(SAMPLE_XML, &transforms, None).unwrap();
         assert!(result.contains(r#"visible="1""#));
     }
 
@@ -566,7 +566,7 @@ mod tests {
             show: vec!["background".to_string()],
             hide: vec!["background".to_string()],
         }];
-        let err = apply_transforms(SAMPLE_XML, &transforms).unwrap_err();
+        let err = apply_transforms(SAMPLE_XML, &transforms, None).unwrap_err();
         assert!(err.to_string().contains("both show and hide"));
     }
 
@@ -576,7 +576,7 @@ mod tests {
             show: vec!["nonexistent".to_string()],
             hide: vec![],
         }];
-        let err = apply_transforms(SAMPLE_XML, &transforms).unwrap_err();
+        let err = apply_transforms(SAMPLE_XML, &transforms, None).unwrap_err();
         assert!(err.to_string().contains("does not exist"));
     }
 }
