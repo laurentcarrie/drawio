@@ -2,6 +2,8 @@
 name = "drawio-lc"
 version = "0.3.0"
 edition = "2024"
+description = "CLI tool to apply transforms to draw.io diagrams and export them to PNG/GIF/MP4"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
