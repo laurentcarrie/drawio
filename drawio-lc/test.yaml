@@ -1,0 +1,11 @@
+original: ../test.drawio
+derived:
+  - output: ../step1.drawio
+    from: ../test.drawio
+    transforms:
+      - type: Color
+        id: iq7qwQ3zTcZndBoYMNhC-1
+        color: "#AE4132"
+      - type: Color
+        id: iq7qwQ3zTcZndBoYMNhC-2
+        color: "#AE4132"
