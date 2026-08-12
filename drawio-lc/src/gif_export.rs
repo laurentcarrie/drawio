@@ -5,7 +5,10 @@ use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba, RgbaImage};
 
 /// Build an animated GIF from a list of PNG paths.
 /// The GIF is written to `output_path`.
-/// Each frame is displayed for `delay_ms` milliseconds (rounded to centiseconds).
+/// `delays_ms` must have the same length as `png_paths`; each entry is the
+/// display duration of the corresponding frame in milliseconds (rounded to
+/// centiseconds).  If a single uniform delay is needed, pass a slice where
+/// every element is the same value.
 ///
 /// All frames are placed on a white canvas sized to the maximum width and
 /// height across all input PNGs. Frames smaller than the canvas are centred
@@ -13,10 +16,18 @@ use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba, RgbaImage};
 pub fn build_animated_gif(
     png_paths: &[&Path],
     output_path: &Path,
-    delay_ms: u32,
+    delays_ms: &[u32],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if png_paths.is_empty() {
         return Err("No PNG frames provided for GIF".into());
+    }
+    if delays_ms.len() != png_paths.len() {
+        return Err(format!(
+            "build_animated_gif: {} paths but {} delays",
+            png_paths.len(),
+            delays_ms.len()
+        )
+        .into());
     }
 
     // Load all images first so we can determine the common canvas size.
@@ -34,10 +45,7 @@ pub fn build_animated_gif(
     let mut encoder = Encoder::new(output_file, width as u16, height as u16, &[])?;
     encoder.set_repeat(Repeat::Infinite)?;
 
-    // GIF delay is in centiseconds.
-    let delay_cs = (delay_ms / 10) as u16;
-
-    for img in &images {
+    for (img, &delay_ms) in images.iter().zip(delays_ms.iter()) {
         let (iw, ih) = img.dimensions();
         let canvas: RgbaImage = if (iw, ih) == (width, height) {
             img.to_rgba8()
@@ -53,6 +61,8 @@ pub fn build_animated_gif(
             canvas
         };
 
+        // GIF delay is in centiseconds.
+        let delay_cs = (delay_ms / 10) as u16;
         let mut pixels = canvas.into_raw();
         let mut frame = Frame::from_rgba_speed(width as u16, height as u16, &mut pixels, 10);
         frame.delay = delay_cs;

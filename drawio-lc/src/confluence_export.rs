@@ -5,13 +5,17 @@ use crate::model::ConfluenceConfig;
 /// Push slides to Confluence Cloud:
 /// 1. Resolve or create the target page.
 /// 2. Upload every PNG as an attachment (update if already present).
-/// 3. Replace the page body with a native Confluence gallery macro so the
+/// 3. Upload the global MP4 as an attachment.
+/// 4. Upload each section MP4 as an attachment.
+/// 5. Replace the page body with a native Confluence gallery macro so the
 ///    slides are browsable without any HTML macro being enabled.
 ///
 /// Auth: reads CONFLUENCE_USER (email) and CONFLUENCE_TOKEN (API token) from
 /// the environment.
 pub fn push_to_confluence(
     png_paths: &[&Path],
+    mp4_path: &Path,
+    section_mp4_paths: &[&Path],
     cfg: &ConfluenceConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let user = env::var("CONFLUENCE_USER").map_err(|_| {
@@ -35,7 +39,19 @@ pub fn push_to_confluence(
 
     // ── 2. Upload attachments ─────────────────────────────────────────────────
     for path in png_paths {
-        upload_attachment(&agent, base, &user, &token, &page_id, path)?;
+        upload_attachment(&agent, base, &user, &token, &page_id, path, "image/png")?;
+        println!(
+            "Uploaded attachment: {}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        );
+    }
+    upload_attachment(&agent, base, &user, &token, &page_id, mp4_path, "video/mp4")?;
+    println!(
+        "Uploaded attachment: {}",
+        mp4_path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    for path in section_mp4_paths {
+        upload_attachment(&agent, base, &user, &token, &page_id, path, "video/mp4")?;
         println!(
             "Uploaded attachment: {}",
             path.file_name().unwrap_or_default().to_string_lossy()
@@ -52,7 +68,16 @@ pub fn push_to_confluence(
                 .to_string()
         })
         .collect();
-    let body = build_page_body(&filenames);
+    let section_mp4_filenames: Vec<String> = section_mp4_paths
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    let body = build_page_body(&filenames, mp4_path, &section_mp4_filenames);
 
     update_page_body(&agent, base, &user, &token, &page_id, &cfg.page_title, &body)?;
     println!(
@@ -269,6 +294,7 @@ fn upload_attachment(
     token: &str,
     page_id: &str,
     path: &Path,
+    mime_type: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth = auth_header(user, token);
     let filename = path
@@ -314,8 +340,8 @@ fn upload_attachment(
     // file part
     multipart.extend_from_slice(
         format!(
-            "--{}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\nContent-Type: image/png\r\n\r\n",
-            boundary, filename
+            "--{}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n",
+            boundary, filename, mime_type
         )
         .as_bytes(),
     );
@@ -346,41 +372,73 @@ fn upload_attachment(
 /// against Confluence Cloud). Keeping the other slides in the content — merely
 /// collapsed — gives the viewer its collection back while keeping them out of
 /// sight.
-fn build_page_body(filenames: &[String]) -> String {
-    let Some((first, rest)) = filenames.split_first() else {
+///
+/// The MP4 is embedded below using the `widget` macro so Confluence renders it
+/// with its native video player (play/pause/seek controls).
+fn build_page_body(filenames: &[String], mp4_path: &Path, section_mp4_filenames: &[String]) -> String {
+    let mp4_filename = mp4_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    if filenames.is_empty() {
         return "<p>No slides were generated.</p>".to_string();
     };
 
     let mut body = format!(
-        r#"<p>Click the slide to open the viewer, then use Prev / Next to step through all {} slides.</p>
-<ac:image><ri:attachment ri:filename="{}" /></ac:image>"#,
+        r#"<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">▶ Play animation ({} slides)</ac:parameter>
+  <ac:rich-text-body>
+<ac:structured-macro ac:name="multimedia">
+  <ac:parameter ac:name="name"><ri:attachment ri:filename="{}" /></ac:parameter>
+  <ac:parameter ac:name="autostart">false</ac:parameter>
+</ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>"#,
         filenames.len(),
-        first
+        mp4_filename,
     );
 
-    if !rest.is_empty() {
-        let images: String = rest
-            .iter()
-            .map(|name| {
-                format!(
-                    r#"<ac:image><ri:attachment ri:filename="{}" /></ac:image>"#,
-                    name
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+    // Section animations — one expand block per section MP4.
+    for (i, section_mp4) in section_mp4_filenames.iter().enumerate() {
         body.push_str(&format!(
             r#"
 <ac:structured-macro ac:name="expand">
-  <ac:parameter ac:name="title">Slides 2-{}</ac:parameter>
+  <ac:parameter ac:name="title">▶ Animation section {} </ac:parameter>
+  <ac:rich-text-body>
+<ac:structured-macro ac:name="multimedia">
+  <ac:parameter ac:name="name"><ri:attachment ri:filename="{}" /></ac:parameter>
+  <ac:parameter ac:name="autostart">false</ac:parameter>
+</ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>"#,
+            i + 1,
+            section_mp4,
+        ));
+    }
+
+    let all_images: String = filenames
+        .iter()
+        .map(|name| {
+            format!(
+                r#"<ac:image><ri:attachment ri:filename="{}" /></ac:image>"#,
+                name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    body.push_str(&format!(
+        r#"
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Browse slides ({} slides)</ac:parameter>
   <ac:rich-text-body>
 {}
   </ac:rich-text-body>
 </ac:structured-macro>"#,
-            filenames.len(),
-            images
-        ));
-    }
+        filenames.len(),
+        all_images
+    ));
 
     body
 }
