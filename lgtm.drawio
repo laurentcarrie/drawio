@@ -1,0 +1,25 @@
+<mxfile host="Electron">
+  <diagram name="Page-1" id="r577zUXKYAydNmtp9Kr1">
+    <mxGraphModel dx="3969" dy="2022" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <object label="" tags="cadre" id="Wsu6Y5XEJIXBmM903lQM-2">
+          <mxCell parent="1" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1">
+            <mxGeometry height="1000" width="1560" x="-300" y="40" as="geometry" />
+          </mxCell>
+        </object>
+        <object label="" tags="image" id="Wsu6Y5XEJIXBmM903lQM-3">
+          <mxCell parent="1" style="rounded=1;whiteSpace=wrap;html=1;" vertex="1">
+            <mxGeometry height="60" width="120" x="420" y="510" as="geometry" />
+          </mxCell>
+        </object>
+        <object label="" tags="titre" id="Wsu6Y5XEJIXBmM903lQM-4">
+          <mxCell parent="1" style="rounded=1;whiteSpace=wrap;html=1;strokeColor=none;" vertex="1">
+            <mxGeometry height="60" width="1090" x="-65" y="140" as="geometry" />
+          </mxCell>
+        </object>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

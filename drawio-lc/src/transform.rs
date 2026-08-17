@@ -1,5 +1,7 @@
 use std::{collections::{HashMap, HashSet}, fs, io::Write, path::Path, process::Command};
 
+use image::GenericImageView;
+
 use pulldown_cmark::{html, Options, Parser};
 use quick_xml::{
     events::{BytesStart, Event},
@@ -178,6 +180,10 @@ fn apply_transforms(
     // so the inner mxCell (which has no id of its own) can be patched.
     let mut user_object_id: Option<String> = None;
 
+    // When the last mxCell processed was an EmbedImage target, holds the
+    // (width, height) to apply to the next mxGeometry child element.
+    let mut pending_geometry: Option<(Option<f64>, Option<f64>)> = None;
+
     loop {
         match reader.read_event()? {
             Event::Eof => break,
@@ -199,12 +205,24 @@ fn apply_transforms(
 
             // mxCell — patch using its own id, or its parent UserObject's id.
             Event::Start(elem) if elem.name().as_ref() == b"mxCell" => {
-                let patched = patch_cell(elem, &resolved_transforms, &edge_ids_to_recolor, heading_margin_bottom, list_item_spacing, list_item_indent, user_object_id.as_deref(), config_dir)?;
+                let (patched, geom) = patch_cell_with_geometry(elem, &resolved_transforms, &edge_ids_to_recolor, heading_margin_bottom, list_item_spacing, list_item_indent, user_object_id.as_deref(), config_dir)?;
+                pending_geometry = geom;
                 writer.write_event(Event::Start(patched))?;
             }
             Event::Empty(elem) if elem.name().as_ref() == b"mxCell" => {
-                let patched = patch_cell(elem, &resolved_transforms, &edge_ids_to_recolor, heading_margin_bottom, list_item_spacing, list_item_indent, user_object_id.as_deref(), config_dir)?;
+                let (patched, geom) = patch_cell_with_geometry(elem, &resolved_transforms, &edge_ids_to_recolor, heading_margin_bottom, list_item_spacing, list_item_indent, user_object_id.as_deref(), config_dir)?;
+                pending_geometry = geom;
                 writer.write_event(Event::Empty(patched))?;
+            }
+
+            // mxGeometry — if inside an EmbedImage cell, update width/height.
+            Event::Empty(elem) if elem.name().as_ref() == b"mxGeometry" => {
+                if let Some((w, h)) = pending_geometry.take() {
+                    let patched = patch_geometry(elem, w, h)?;
+                    writer.write_event(Event::Empty(patched))?;
+                } else {
+                    writer.write_event(Event::Empty(elem))?;
+                }
             }
 
             other => {
@@ -371,6 +389,33 @@ fn resolve_transforms(
             begin: *begin,
             end: *end,
         },
+        Transform::ShapeAttributes { tags, shape, fill_color, stroke_color, text, font_size } => Transform::ShapeAttributes {
+            tags: expand_list(tags),
+            shape: shape.clone(),
+            fill_color: fill_color.clone(),
+            stroke_color: stroke_color.clone(),
+            text: text.clone(),
+            font_size: *font_size,
+        },
+        Transform::EdgeAttributes { tags, text, color, line_style, thickness, font_color, font_size, text_background, text_border_color, start_arrow, end_arrow } => Transform::EdgeAttributes {
+            tags: expand_list(tags),
+            text: text.clone(),
+            color: color.clone(),
+            line_style: line_style.clone(),
+            thickness: *thickness,
+            font_color: font_color.clone(),
+            font_size: *font_size,
+            text_background: text_background.clone(),
+            text_border_color: text_border_color.clone(),
+            start_arrow: start_arrow.clone(),
+            end_arrow: end_arrow.clone(),
+        },
+        Transform::EmbedImage { tag, file, width, height } => Transform::EmbedImage {
+            tag: expand(tag).into_iter().next().unwrap_or_else(|| tag.clone()),
+            file: file.clone(),
+            width: *width,
+            height: *height,
+        },
         // TitleSlide and Animation don't reference cell ids.
         other => other.clone(),
     }).collect()
@@ -461,6 +506,15 @@ fn validate_replace_text_transforms(
                 .iter()
                 .map(|tag| ("ArrowVisibility", tag.as_str()))
                 .collect(),
+            Transform::ShapeAttributes { tags, .. } => tags
+                .iter()
+                .map(|tag| ("ShapeAttributes", tag.as_str()))
+                .collect(),
+            Transform::EdgeAttributes { tags, .. } => tags
+                .iter()
+                .map(|tag| ("EdgeAttributes", tag.as_str()))
+                .collect(),
+            Transform::EmbedImage { tag, .. } => vec![("EmbedImage", tag.as_str())],
             Transform::ElementVisibility { show, hide } => show
                 .iter()
                 .map(|tag| ("ElementVisibility", tag.as_str()))
@@ -747,8 +801,11 @@ fn patch_wrapper(
 }
 
 /// For one `<mxCell …>` element, apply Color, ColorEdges, ElementVisibility,
-/// ReplaceText and ImportMarkdown transforms.
-fn patch_cell(
+/// ReplaceText, ImportMarkdown, ShapeAttributes, EdgeAttributes, EmbedImage,
+/// and ArrowVisibility transforms.
+/// Returns the patched element and, for EmbedImage targets, the (width, height)
+/// to apply to the following mxGeometry child.
+fn patch_cell_with_geometry(
     elem: BytesStart,
     transforms: &[Transform],
     edge_ids_to_recolor: &HashMap<String, HashSet<String>>,
@@ -757,7 +814,7 @@ fn patch_cell(
     list_item_indent: u32,
     user_object_id: Option<&str>,
     config_dir: &Path,
-) -> Result<BytesStart<'static>, Box<dyn std::error::Error>> {
+) -> Result<(BytesStart<'static>, Option<(Option<f64>, Option<f64>)>), Box<dyn std::error::Error>> {
     let mut attrs: Vec<(Vec<u8>, Vec<u8>)> = elem
         .attributes()
         .filter_map(|a| a.ok())
@@ -850,10 +907,172 @@ fn patch_cell(
                 patch_arrow_visibility(&mut attrs, *begin, *end);
             }
 
+            // --- ShapeAttributes ---
+            Transform::ShapeAttributes { tags, shape, fill_color, stroke_color, text, font_size }
+                if tags.contains(&id) =>
+            {
+                if let Some(s) = shape {
+                    patch_style_token_mut(&mut attrs, "shape", &format!("mxgraph.basic.{}", s));
+                }
+                if let Some(c) = fill_color {
+                    patch_style_token_in_attrs(&mut attrs, "fillColor", c);
+                }
+                if let Some(c) = stroke_color {
+                    patch_style_token_in_attrs(&mut attrs, "strokeColor", c);
+                }
+                if let Some(fs) = font_size {
+                    patch_style_token_in_attrs(&mut attrs, "fontSize", &fs.to_string());
+                }
+                if let Some(t) = text {
+                    let formatted = markdown_to_xml_attr(t, heading_margin_bottom, list_item_spacing, list_item_indent);
+                    // mxCell stores label in `value`; wrapper elements use `label`.
+                    for (key, val) in attrs.iter_mut() {
+                        if key == b"value" || key == b"label" {
+                            *val = formatted.clone().into_bytes();
+                        }
+                    }
+                }
+            }
+
+            // --- EdgeAttributes ---
+            Transform::EdgeAttributes {
+                tags, text, color, line_style, thickness,
+                font_color, font_size, text_background, text_border_color,
+                start_arrow, end_arrow,
+            } if tags.contains(&id) => {
+                if let Some(c) = color {
+                    patch_style_token_in_attrs(&mut attrs, "strokeColor", c);
+                }
+                if let Some(ls) = line_style {
+                    match ls.as_str() {
+                        "dashed" => {
+                            patch_style_token_in_attrs(&mut attrs, "dashed", "1");
+                        }
+                        "dotted" => {
+                            patch_style_token_in_attrs(&mut attrs, "dashed", "1");
+                            patch_style_token_in_attrs(&mut attrs, "dashPattern", "1 4");
+                        }
+                        "solid" => {
+                            patch_style_token_in_attrs(&mut attrs, "dashed", "0");
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(t) = thickness {
+                    patch_style_token_in_attrs(&mut attrs, "strokeWidth", &t.to_string());
+                }
+                if let Some(c) = font_color {
+                    patch_style_token_in_attrs(&mut attrs, "fontColor", c);
+                    // Also update the XML-level `fontColor` attribute if present.
+                    for (key, val) in attrs.iter_mut() {
+                        if key == b"fontColor" {
+                            *val = c.as_bytes().to_vec();
+                        }
+                    }
+                }
+                if let Some(fs) = font_size {
+                    patch_style_token_in_attrs(&mut attrs, "fontSize", &fs.to_string());
+                }
+                if let Some(bg) = text_background {
+                    patch_style_token_in_attrs(&mut attrs, "labelBackgroundColor", bg);
+                }
+                if let Some(bc) = text_border_color {
+                    patch_style_token_in_attrs(&mut attrs, "labelBorderColor", bc);
+                }
+                if let Some(sa) = start_arrow {
+                    patch_style_token_in_attrs(&mut attrs, "startArrow", sa);
+                }
+                if let Some(ea) = end_arrow {
+                    patch_style_token_in_attrs(&mut attrs, "endArrow", ea);
+                }
+                if let Some(t) = text {
+                    let formatted = markdown_to_xml_attr(t, heading_margin_bottom, list_item_spacing, list_item_indent);
+                    for (key, val) in attrs.iter_mut() {
+                        if key == b"value" || key == b"label" {
+                            *val = formatted.clone().into_bytes();
+                        }
+                    }
+                }
+            }
+
             _ => {}
         }
     }
 
+    // Handle EmbedImage: update style to a data URI and collect geometry changes.
+    let mut pending_geom: Option<(Option<f64>, Option<f64>)> = None;
+    for t in transforms {
+        if let Transform::EmbedImage { tag, file, width, height } = t {
+            if tag == &id {
+                let path = config_dir.join(file);
+                let img_bytes = fs::read(&path).map_err(|e| {
+                    format!("EmbedImage: could not read {:?}: {}", path, e)
+                })?;
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
+                let mime = if file.ends_with(".png") { "image/png" }
+                    else if file.ends_with(".jpg") || file.ends_with(".jpeg") { "image/jpeg" }
+                    else { "image/png" };
+                let data_uri = format!("data:{};base64,{}", mime, b64);
+                // Replace the style with an image style using the data URI.
+                let new_style = format!("shape=image;verticalLabelPosition=bottom;labelBackgroundColor=#ffffff;verticalAlign=top;align=center;strokeColor=none;fillColor=none;image;image={};", data_uri);
+                if let Some((_, val)) = attrs.iter_mut().find(|(k, _)| k == b"style") {
+                    *val = new_style.into_bytes();
+                } else {
+                    attrs.push((b"style".to_vec(), new_style.into_bytes()));
+                }
+                // Determine final width/height by loading actual image dimensions.
+                let actual = image::load_from_memory(&img_bytes).ok().map(|i| i.dimensions());
+                let (w_out, h_out) = match (*width, *height) {
+                    (Some(w), Some(h)) => (Some(w), Some(h)),
+                    (Some(w), None) => {
+                        let h = actual.map(|(aw, ah)| w * ah as f64 / aw as f64);
+                        (Some(w), h)
+                    }
+                    (None, Some(h)) => {
+                        let w = actual.map(|(aw, ah)| h * aw as f64 / ah as f64);
+                        (w, Some(h))
+                    }
+                    (None, None) => (
+                        actual.map(|(w, _)| w as f64),
+                        actual.map(|(_, h)| h as f64),
+                    ),
+                };
+                pending_geom = Some((w_out, h_out));
+                break;
+            }
+        }
+    }
+
+    let name = String::from_utf8_lossy(elem.name().as_ref()).into_owned();
+    let mut new_elem = BytesStart::new(name);
+    for (k, v) in &attrs {
+        new_elem.push_attribute((k.as_slice(), v.as_slice()));
+    }
+    Ok((new_elem, pending_geom))
+}
+
+/// Patch the `width` and/or `height` attributes of an `mxGeometry` element.
+fn patch_geometry(
+    elem: BytesStart,
+    width: Option<f64>,
+    height: Option<f64>,
+) -> Result<BytesStart<'static>, Box<dyn std::error::Error>> {
+    let mut attrs: Vec<(Vec<u8>, Vec<u8>)> = elem
+        .attributes()
+        .filter_map(|a| a.ok())
+        .map(|a| (a.key.as_ref().to_vec(), a.value.to_vec()))
+        .collect();
+    if let Some(w) = width {
+        if let Some(entry) = attrs.iter_mut().find(|(k, _)| k == b"width") {
+            entry.1 = format!("{}", w).into_bytes();
+        }
+    }
+    if let Some(h) = height {
+        if let Some(entry) = attrs.iter_mut().find(|(k, _)| k == b"height") {
+            entry.1 = format!("{}", h).into_bytes();
+        }
+    }
     let name = String::from_utf8_lossy(elem.name().as_ref()).into_owned();
     let mut new_elem = BytesStart::new(name);
     for (k, v) in &attrs {
@@ -930,6 +1149,25 @@ fn patch_style_token(style: &str, key: &str, value: &str) -> String {
     } else {
         format!("{};{}={};", style, key, value)
     }
+}
+
+/// Replace (or append) a style token, working directly on the attrs list.
+fn patch_style_token_in_attrs(attrs: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &str, value: &str) {
+    for (k, v) in attrs.iter_mut() {
+        if k == b"style" {
+            let style = String::from_utf8_lossy(v).into_owned();
+            *v = patch_style_token(&style, key, value).into_bytes();
+            return;
+        }
+    }
+    // No `style` attribute yet — create one.
+    attrs.push((b"style".to_vec(), format!("{}={};", key, value).into_bytes()));
+}
+
+/// Patch a style token using the mutable attrs form (alias kept for clarity).
+#[inline]
+fn patch_style_token_mut(attrs: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &str, value: &str) {
+    patch_style_token_in_attrs(attrs, key, value);
 }
 
 /// Replace (or append) the `fillColor` token inside a draw.io style string.

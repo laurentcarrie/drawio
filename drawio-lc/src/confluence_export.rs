@@ -6,9 +6,12 @@ use crate::model::ConfluenceConfig;
 /// 1. Resolve or create the target page.
 /// 2. Upload every PNG as an attachment (update if already present).
 /// 3. Upload the global MP4 as an attachment.
-/// 4. Upload each section MP4 as an attachment.
+/// 4. Upload any per-step section MP4s (Animation-based GIFs converted to MP4).
 /// 5. Replace the page body with a native Confluence gallery macro so the
 ///    slides are browsable without any HTML macro being enabled.
+///
+/// `section_mp4_paths` is a (possibly empty) list of per-step animation MP4s
+/// generated from `Animation`-marker sections in the config.
 ///
 /// Auth: reads CONFLUENCE_USER (email) and CONFLUENCE_TOKEN (API token) from
 /// the environment.
@@ -50,15 +53,17 @@ pub fn push_to_confluence(
         "Uploaded attachment: {}",
         mp4_path.file_name().unwrap_or_default().to_string_lossy()
     );
-    for path in section_mp4_paths {
-        upload_attachment(&agent, base, &user, &token, &page_id, path, "video/mp4")?;
+
+    // ── 3. Upload per-step section MP4s (if any) ─────────────────────────────
+    for section_mp4 in section_mp4_paths {
+        upload_attachment(&agent, base, &user, &token, &page_id, section_mp4, "video/mp4")?;
         println!(
             "Uploaded attachment: {}",
-            path.file_name().unwrap_or_default().to_string_lossy()
+            section_mp4.file_name().unwrap_or_default().to_string_lossy()
         );
     }
 
-    // ── 3. Build page body with Confluence gallery macro ─────────────────────
+    // ── 4. Build page body with Confluence gallery macro ─────────────────────
     let filenames: Vec<String> = png_paths
         .iter()
         .map(|p| {
@@ -68,16 +73,7 @@ pub fn push_to_confluence(
                 .to_string()
         })
         .collect();
-    let section_mp4_filenames: Vec<String> = section_mp4_paths
-        .iter()
-        .map(|p| {
-            p.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
-        })
-        .collect();
-    let body = build_page_body(&filenames, mp4_path, &section_mp4_filenames);
+    let body = build_page_body(&filenames, mp4_path, section_mp4_paths);
 
     update_page_body(&agent, base, &user, &token, &page_id, &cfg.page_title, &body)?;
     println!(
@@ -375,7 +371,7 @@ fn upload_attachment(
 ///
 /// The MP4 is embedded below using the `widget` macro so Confluence renders it
 /// with its native video player (play/pause/seek controls).
-fn build_page_body(filenames: &[String], mp4_path: &Path, section_mp4_filenames: &[String]) -> String {
+fn build_page_body(filenames: &[String], mp4_path: &Path, section_mp4_paths: &[&Path]) -> String {
     let mp4_filename = mp4_path
         .file_name()
         .unwrap_or_default()
@@ -400,12 +396,17 @@ fn build_page_body(filenames: &[String], mp4_path: &Path, section_mp4_filenames:
         mp4_filename,
     );
 
-    // Section animations — one expand block per section MP4.
-    for (i, section_mp4) in section_mp4_filenames.iter().enumerate() {
+    // Embed per-step section animations (if any).
+    for (idx, section_mp4) in section_mp4_paths.iter().enumerate() {
+        let section_filename = section_mp4
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         body.push_str(&format!(
             r#"
 <ac:structured-macro ac:name="expand">
-  <ac:parameter ac:name="title">▶ Animation section {} </ac:parameter>
+  <ac:parameter ac:name="title">▶ Section animation {}</ac:parameter>
   <ac:rich-text-body>
 <ac:structured-macro ac:name="multimedia">
   <ac:parameter ac:name="name"><ri:attachment ri:filename="{}" /></ac:parameter>
@@ -413,8 +414,8 @@ fn build_page_body(filenames: &[String], mp4_path: &Path, section_mp4_filenames:
 </ac:structured-macro>
   </ac:rich-text-body>
 </ac:structured-macro>"#,
-            i + 1,
-            section_mp4,
+            idx + 1,
+            section_filename,
         ));
     }
 

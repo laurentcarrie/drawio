@@ -59,8 +59,16 @@ pub struct ConfluenceConfig {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Derived {
     pub output: String,
-    pub from: String,
+    /// Source file or the output name of a previous step to use as input.
+    /// If omitted, defaults to the `output` of the immediately preceding
+    /// non-TitleSlide step.  The first step must always provide `from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
     pub transforms: Vec<Transform>,
+    /// If present, the exported PNG is cropped to the bounding box of the
+    /// draw.io cell whose tag matches this value (instead of the full canvas).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounding_box_tag: Option<String>,
     /// Optional delay (in milliseconds) to display this slide in the animated
     /// GIF/MP4.  Overrides `delay_between_slides` for this specific slide.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,5 +122,76 @@ pub enum Transform {
         begin: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         end: Option<bool>,
+    },
+    /// Change visual attributes of shape (non-edge) cells selected by tag.
+    /// All fields except `tags` are optional; omitted fields are left unchanged.
+    ShapeAttributes {
+        tags: Vec<String>,
+        /// draw.io shape name, e.g. "rhombus", "ellipse", "hexagon".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shape: Option<String>,
+        /// Fill color as a CSS hex string, e.g. "#DDDDDD".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fill_color: Option<String>,
+        /// Stroke (border) color as a CSS hex string.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stroke_color: Option<String>,
+        /// Replace the cell label with this text (Markdown supported).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        /// Font size in points.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        font_size: Option<u32>,
+    },
+    /// Change visual attributes of edge cells selected by tag.
+    /// All fields except `tags` are optional; omitted fields are left unchanged.
+    EdgeAttributes {
+        tags: Vec<String>,
+        /// Replace the edge label with this text (Markdown supported).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        /// Stroke color as a CSS hex string or named color, e.g. "red".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<String>,
+        /// Line style: "dashed", "dotted", or "solid".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line_style: Option<String>,
+        /// Stroke thickness in pixels.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thickness: Option<f64>,
+        /// Font color for the label text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        font_color: Option<String>,
+        /// Font size in points.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        font_size: Option<u32>,
+        /// Background color of the label box.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text_background: Option<String>,
+        /// Border color of the label box.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text_border_color: Option<String>,
+        /// Start arrowhead type, e.g. "none", "classic", "open".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_arrow: Option<String>,
+        /// End arrowhead type, e.g. "none", "classic", "open".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_arrow: Option<String>,
+    },
+    /// Embed an external image file into an image-placeholder cell.
+    /// The cell is selected by `tag`; its style is updated to use a base64-
+    /// encoded data URI, and the geometry is resized to `width` × `height`.
+    EmbedImage {
+        /// draw.io tag of the target image cell.
+        tag: String,
+        /// Path to the image file, relative to the config directory.
+        file: String,
+        /// Desired display width in pixels.  Height is scaled proportionally.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<f64>,
+        /// Desired display height in pixels.  Width is scaled proportionally.
+        /// If both `width` and `height` are given, both are used as-is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<f64>,
     },
 }

@@ -17,17 +17,24 @@ fn validate_config(config: &Config) {
         process::exit(1);
     }
 
+    // The first step must have an explicit 'from'.
+    if config.derived[0].from.is_none() {
+        eprintln!("Error: the first derived step must have an explicit 'from' field.");
+        process::exit(1);
+    }
+
     let mut available: std::collections::HashSet<&str> = std::collections::HashSet::new();
     // The first step's 'from' is the root source; seed it as available.
-    available.insert(&config.derived[0].from);
+    available.insert(config.derived[0].from.as_deref().unwrap());
 
     for (i, derived) in config.derived.iter().enumerate() {
-        if !available.contains(derived.from.as_str()) {
+        let from = derived.from.as_deref().unwrap_or("");
+        if !from.is_empty() && !available.contains(from) && !std::path::Path::new(from).is_file() {
             eprintln!(
-                "Error in step {}: 'from' field '{}' is not the source file nor the output of a previous step.\n\
+                "Error in step {}: 'from' field '{}' is not the source file, a local file, nor the output of a previous step.\n\
                  Available sources at this point: [{}]",
                 i + 1,
-                derived.from,
+                from,
                 available
                     .iter()
                     .cloned()
@@ -37,6 +44,31 @@ fn validate_config(config: &Config) {
             process::exit(1);
         }
         available.insert(&derived.output);
+    }
+}
+
+fn is_title_slide(derived: &model::Derived) -> bool {
+    derived.transforms.len() == 1
+        && matches!(derived.transforms[0], model::Transform::TitleSlide { .. })
+}
+
+/// Fill in missing `from` fields by walking backwards to find the nearest
+/// non-TitleSlide predecessor's output.  If all predecessors are TitleSlides,
+/// falls back to the root source (the `from` of the first step).
+/// Must be called before `validate_config`.
+fn resolve_from_fields(config: &mut Config) {
+    for i in 1..config.derived.len() {
+        if config.derived[i].from.is_some() {
+            continue;
+        }
+        // Walk backwards to find the nearest non-TitleSlide predecessor.
+        let resolved = (0..i)
+            .rev()
+            .find(|&j| !is_title_slide(&config.derived[j]))
+            .map(|j| config.derived[j].output.clone())
+            // All predecessors were TitleSlides — fall back to the root source.
+            .or_else(|| config.derived[0].from.clone());
+        config.derived[i].from = resolved;
     }
 }
 
@@ -96,7 +128,8 @@ fn generate_section_gif(
     let frame0_drawio = tmp_dir.join(format!("{}.s{}.f0.drawio", stem, section_idx));
     let frame0_derived = Derived {
         output: frame0_drawio.to_string_lossy().into_owned(),
-        from: String::new(),
+        from: Some(String::new()),
+        bounding_box_tag: None,
         transforms: vec![],
         delay: None,
     };
@@ -122,7 +155,8 @@ fn generate_section_gif(
         let partial_transforms: Vec<Transform> = section[..=t_idx].to_vec();
         let partial_derived = Derived {
             output: frame_drawio.to_string_lossy().into_owned(),
-            from: String::new(),
+            from: Some(String::new()),
+            bounding_box_tag: None,
             transforms: partial_transforms,
             delay: None,
         };
@@ -163,9 +197,10 @@ fn generate_section_gif(
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Parse arguments: mandatory <config.yaml>, optional --step <output>
+    // Parse arguments: mandatory <config.yaml>, optional --step <output>, --no-confluence
     let mut yaml_arg: Option<&str> = None;
     let mut step_filter: Option<&str> = None;
+    let mut no_confluence = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -176,6 +211,9 @@ fn main() {
                     process::exit(1);
                 }
                 step_filter = Some(&args[i]);
+            }
+            "--no-confluence" => {
+                no_confluence = true;
             }
             arg if !arg.starts_with('-') => {
                 yaml_arg = Some(arg);
@@ -189,7 +227,7 @@ fn main() {
     }
 
     let yaml_arg = yaml_arg.unwrap_or_else(|| {
-        eprintln!("Usage: {} <config.yaml> [--step <output>]", args[0]);
+        eprintln!("Usage: {} <config.yaml> [--step <output>] [--no-confluence]", args[0]);
         process::exit(1);
     });
 
@@ -200,11 +238,12 @@ fn main() {
         process::exit(1);
     });
 
-    let config: Config = serde_yaml::from_str(&content).unwrap_or_else(|e| {
+    let mut config: Config = serde_yaml::from_str(&content).unwrap_or_else(|e| {
         eprintln!("Error parsing YAML: {}", e);
         process::exit(1);
     });
 
+    resolve_from_fields(&mut config);
     validate_config(&config);
 
     // Directory containing the config file — used to resolve relative paths
@@ -224,11 +263,15 @@ fn main() {
     }
 
     // The root source file is the 'from' of the first step.
-    let source_file = &config.derived[0].from;
+    let source_file = config.derived[0].from.as_deref().unwrap_or_else(|| {
+        eprintln!("Internal error: first step 'from' not resolved");
+        process::exit(1);
+    });
+    let source_file = source_file.to_string();
 
     // Export the source file to a temp PNG to get the reference dimensions.
-    let ref_png = Path::new(source_file).with_extension("_ref.png");
-    transform::export_reference_png(Path::new(source_file), &ref_png).unwrap_or_else(|e| {
+    let ref_png = Path::new(&source_file).with_extension("_ref.png");
+    transform::export_reference_png(Path::new(&source_file), &ref_png).unwrap_or_else(|e| {
         eprintln!("Error exporting reference PNG: {}", e);
         process::exit(1);
     });
@@ -244,7 +287,7 @@ fn main() {
     println!("{} -> {}", source_file, ref_png.display());
     println!("Reference size: {}x{}px", ref_size.0, ref_size.1);
 
-    let input_xml = fs::read_to_string(source_file).unwrap_or_else(|e| {
+    let input_xml = fs::read_to_string(&source_file).unwrap_or_else(|e| {
         eprintln!("Error reading source file {}: {}", source_file, e);
         process::exit(1);
     });
@@ -298,8 +341,25 @@ fn main() {
         .collect();
 
     for derived in &config.derived {
-        let from_xml = xml_cache.get(&derived.from).unwrap_or_else(|| {
-            eprintln!("Internal error: XML for '{}' not in cache", derived.from);
+        let from_key = derived.from.as_deref().unwrap_or_else(|| {
+            eprintln!("Internal error: 'from' not resolved for step '{}'", derived.output);
+            process::exit(1);
+        });
+
+        // Load from file if not already in cache (e.g., when 'from' points to an
+        // external .drawio file that is not the root source).
+        if !xml_cache.contains_key(from_key) {
+            match fs::read_to_string(from_key) {
+                Ok(xml) => { xml_cache.insert(from_key.to_string(), xml); }
+                Err(e) => {
+                    eprintln!("Error: cannot read 'from' file '{}': {}", from_key, e);
+                    process::exit(1);
+                }
+            }
+        }
+
+        let from_xml = xml_cache.get(from_key).unwrap_or_else(|| {
+            eprintln!("Internal error: XML for '{}' not in cache", from_key);
             process::exit(1);
         });
 
@@ -455,13 +515,15 @@ fn main() {
     });
     println!("Generated {}", html_path.display());
 
-    // Optionally push slides to Confluence if configured.
-    if let Some(ref cf) = config.confluence {
-        let section_mp4_refs: Vec<&Path> = section_mp4_paths.iter().map(|p| p.as_path()).collect();
-        confluence_export::push_to_confluence(&png_path_refs, &mp4_path, &section_mp4_refs, cf).unwrap_or_else(|e| {
-            eprintln!("Error pushing to Confluence: {}", e);
-            process::exit(1);
-        });
+    // Optionally push slides to Confluence if configured and not suppressed.
+    if !no_confluence {
+        if let Some(ref cf) = config.confluence {
+            let section_mp4_refs: Vec<&Path> = section_mp4_paths.iter().map(|p| p.as_path()).collect();
+            confluence_export::push_to_confluence(&png_path_refs, &mp4_path, &section_mp4_refs, cf).unwrap_or_else(|e| {
+                eprintln!("Error pushing to Confluence: {}", e);
+                process::exit(1);
+            });
+        }
     }
 }
 
