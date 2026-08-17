@@ -278,7 +278,7 @@ fn generate_section_gif(
     list_item_indent: u32,
     config_dir: &Path,
     delay_ms: u32,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(String, std::path::PathBuf), Box<dyn std::error::Error>> {
     let mut frame_pngs: Vec<std::path::PathBuf> = Vec::new();
     let mut current_xml = before_xml.to_string();
 
@@ -342,17 +342,23 @@ fn generate_section_gif(
         frame_pngs.push(frame_png);
     }
 
-    // Build the section GIF with a uniform delay for all frames.
     let frame_refs: Vec<&Path> = frame_pngs.iter().map(|p| p.as_path()).collect();
     let delays: Vec<u32> = vec![delay_ms; frame_refs.len()];
+
+    // Build the section GIF.
     gif_export::build_animated_gif(&frame_refs, gif_path, &delays)?;
+
+    // Build the section MP4 directly from PNGs (no GIF intermediate) while
+    // the frame files still exist.
+    let mp4_path = gif_path.with_extension("mp4");
+    export_mp4(&frame_refs, &delays, &mp4_path)?;
 
     // Clean up temporary frame PNGs.
     for p in &frame_pngs {
         let _ = fs::remove_file(p);
     }
 
-    Ok(current_xml)
+    Ok((current_xml, mp4_path))
 }
 
 fn main() {
@@ -469,9 +475,9 @@ fn main() {
     let mut xml_cache: HashMap<String, String> = HashMap::new();
     xml_cache.insert(source_file.clone(), input_xml);
 
-    // Collect section GIF paths across all steps, in order — converted to MP4
-    // after the main loop and pushed to Confluence.
+    // Collect section GIF/MP4 paths across all steps, in order.
     let mut section_gif_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut section_mp4_paths: Vec<std::path::PathBuf> = Vec::new();
 
     // Per-step PNGs and section GIFs/MP4s go into sandbox-<stem>/.
     // The final GIF, MP4, and HTML stay in the directory of the config file.
@@ -629,9 +635,11 @@ fn main() {
                     config.delay_between_slides,
                 );
                 match result {
-                    Ok(xml_after) => {
+                    Ok((xml_after, mp4_path)) => {
                         println!("Generated {}", gif_path.display());
+                        println!("Generated {}", mp4_path.display());
                         section_gif_paths.push(gif_path.clone());
+                        section_mp4_paths.push(mp4_path);
                         section_xml = xml_after;
                     }
                     Err(e) => {
@@ -668,18 +676,6 @@ fn main() {
         return;
     }
 
-    // Convert section GIFs to MP4 for Confluence embedding.
-    let mut section_mp4_paths: Vec<std::path::PathBuf> = Vec::new();
-    for gif_path in &section_gif_paths {
-        let mp4_path = gif_path.with_extension("mp4");
-        export_mp4(gif_path, &mp4_path).unwrap_or_else(|e| {
-            eprintln!("Error building section MP4 {}: {}", mp4_path.display(), e);
-            process::exit(1);
-        });
-        println!("Generated {}", mp4_path.display());
-        section_mp4_paths.push(mp4_path);
-    }
-
     // Build animated GIF from all generated PNGs in step order.
     // Each slide uses its own `delay` if set, otherwise `delay_between_slides`.
     let png_paths: Vec<_> = config
@@ -704,8 +700,9 @@ fn main() {
     });
     println!("Generated {}", gif_path.display());
 
+    // Build MP4 directly from PNGs — no GIF intermediate, so no colour loss.
     let mp4_path = yaml_stem.with_extension("mp4");
-    export_mp4(&gif_path, &mp4_path).unwrap_or_else(|e| {
+    export_mp4(&png_path_refs, &slide_delays, &mp4_path).unwrap_or_else(|e| {
         eprintln!("Error building MP4: {}", e);
         process::exit(1);
     });
@@ -737,21 +734,56 @@ fn main() {
     }
 }
 
-fn export_mp4(gif_path: &Path, mp4_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Build an MP4 from a list of PNG frames and per-frame durations.
+///
+/// Writes a temporary ffmpeg concat script to a `.txt` file next to the
+/// output, then encodes directly from the full-colour PNGs — no GIF
+/// intermediate, so the output stays sharp.
+fn export_mp4(
+    png_paths: &[&Path],
+    delays_ms: &[u32],
+    mp4_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if png_paths.is_empty() {
+        return Err("No PNG frames for MP4".into());
+    }
+
+    // Write a concat demuxer script: one `file`/`duration` pair per frame.
+    let concat_path = mp4_path.with_extension("concat.txt");
+    let mut lines = String::new();
+    for (png, &delay_ms) in png_paths.iter().zip(delays_ms.iter()) {
+        let abs = png.canonicalize()
+            .unwrap_or_else(|_| png.to_path_buf());
+        // ffmpeg concat demuxer requires forward slashes even on Windows
+        let path_str = abs.to_string_lossy().replace('\\', "/");
+        lines.push_str(&format!("file '{}'\nduration {}\n",
+            path_str, delay_ms as f64 / 1000.0));
+    }
+    // Repeat the last frame so its duration is honoured (ffmpeg concat quirk)
+    if let Some(last) = png_paths.last() {
+        let abs = last.canonicalize().unwrap_or_else(|_| last.to_path_buf());
+        let path_str = abs.to_string_lossy().replace('\\', "/");
+        lines.push_str(&format!("file '{}'\n", path_str));
+    }
+    std::fs::write(&concat_path, &lines)?;
+
     let status = std::process::Command::new("ffmpeg")
         .args([
             "-y",
-            "-i",
-            gif_path.to_str().ok_or("invalid gif path")?,
-            "-vf",
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-r", "25",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_path.to_str().ok_or("invalid concat path")?,
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             "-c:v", "libx264",
+            "-crf", "18",
+            "-preset", "slow",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             mp4_path.to_str().ok_or("invalid mp4 path")?,
         ])
         .status();
+
+    let _ = std::fs::remove_file(&concat_path);
 
     match status {
         Ok(s) if s.success() => Ok(()),
