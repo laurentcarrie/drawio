@@ -736,9 +736,10 @@ fn main() {
 
 /// Build an MP4 from a list of PNG frames and per-frame durations.
 ///
-/// Writes a temporary ffmpeg concat script to a `.txt` file next to the
-/// output, then encodes directly from the full-colour PNGs — no GIF
-/// intermediate, so the output stays sharp.
+/// All frames are centred on a common white canvas (max width × max height
+/// across all PNGs) without any scaling, so every pixel stays sharp and
+/// aspect ratios are fully preserved.  Encoding is done directly from the
+/// PNGs via the ffmpeg concat demuxer — no GIF intermediate.
 fn export_mp4(
     png_paths: &[&Path],
     delays_ms: &[u32],
@@ -748,24 +749,41 @@ fn export_mp4(
         return Err("No PNG frames for MP4".into());
     }
 
-    // Write a concat demuxer script: one `file`/`duration` pair per frame.
+    // Determine the common canvas: maximum width and height across all frames.
+    // Round both up to the nearest even number (H.264 requires even dimensions).
+    let mut max_w: u32 = 0;
+    let mut max_h: u32 = 0;
+    for p in png_paths {
+        let img = image::image_dimensions(p)
+            .map_err(|e| format!("export_mp4: cannot read {}: {}", p.display(), e))?;
+        max_w = max_w.max(img.0);
+        max_h = max_h.max(img.1);
+    }
+    let canvas_w = (max_w + 1) / 2 * 2;
+    let canvas_h = (max_h + 1) / 2 * 2;
+
+    // Write the ffmpeg concat demuxer script.
     let concat_path = mp4_path.with_extension("concat.txt");
     let mut lines = String::new();
     for (png, &delay_ms) in png_paths.iter().zip(delays_ms.iter()) {
-        let abs = png.canonicalize()
-            .unwrap_or_else(|_| png.to_path_buf());
-        // ffmpeg concat demuxer requires forward slashes even on Windows
+        let abs = png.canonicalize().unwrap_or_else(|_| png.to_path_buf());
         let path_str = abs.to_string_lossy().replace('\\', "/");
         lines.push_str(&format!("file '{}'\nduration {}\n",
             path_str, delay_ms as f64 / 1000.0));
     }
-    // Repeat the last frame so its duration is honoured (ffmpeg concat quirk)
+    // Repeat the last frame entry so ffmpeg honours its duration (concat quirk).
     if let Some(last) = png_paths.last() {
         let abs = last.canonicalize().unwrap_or_else(|_| last.to_path_buf());
-        let path_str = abs.to_string_lossy().replace('\\', "/");
-        lines.push_str(&format!("file '{}'\n", path_str));
+        lines.push_str(&format!("file '{}'\n", abs.to_string_lossy().replace('\\', "/")));
     }
     std::fs::write(&concat_path, &lines)?;
+
+    // `pad` centres each frame on the white canvas without scaling.
+    // x_offset = (canvas_w - iw) / 2, y_offset = (canvas_h - ih) / 2.
+    let vf = format!(
+        "pad={}:{}:(ow-iw)/2:(oh-ih)/2:color=white",
+        canvas_w, canvas_h
+    );
 
     let status = std::process::Command::new("ffmpeg")
         .args([
@@ -773,7 +791,7 @@ fn export_mp4(
             "-f", "concat",
             "-safe", "0",
             "-i", concat_path.to_str().ok_or("invalid concat path")?,
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-vf", &vf,
             "-c:v", "libx264",
             "-crf", "18",
             "-preset", "slow",
