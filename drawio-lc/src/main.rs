@@ -45,6 +45,18 @@ fn validate_config(config: &Config) {
             process::exit(1);
         }
         available.insert(&derived.output);
+
+        // bounding_box_tag on a TitleSlide makes no sense: TitleSlide generates
+        // fresh XML that never contains the original diagram cells.
+        if derived.bounding_box_tag.is_some() && is_title_slide(derived) {
+            eprintln!(
+                "Error in step {} ('{}'): 'bounding_box_tag' cannot be used with a TitleSlide transform \
+                 — TitleSlide generates fresh XML without the original diagram cells.",
+                i + 1,
+                derived.output,
+            );
+            process::exit(1);
+        }
     }
 }
 
@@ -54,6 +66,144 @@ fn validate_config(config: &Config) {
 ///      "step1"                 → "step1"
 fn strip_drawio_ext(output: &str) -> &str {
     output.strip_suffix(".drawio").unwrap_or(output)
+}
+
+/// Validate that every transform in the YAML uses only known fields.
+/// Parses the raw YAML as a generic `Value` tree so we can inspect keys that
+/// serde silently drops when deserialising into typed structs.
+/// Exits with a helpful message on the first violation found.
+fn validate_unknown_fields(content: &str, yaml_file: &str) {
+    use std::collections::HashSet;
+
+    // Known fields per transform type (always includes "type").
+    let known: std::collections::HashMap<&str, HashSet<&str>> = [
+        ("Color",             ["type","tags","color"].iter().cloned().collect()),
+        ("ColorEdges",        ["type","exclude","color"].iter().cloned().collect()),
+        ("ReplaceText",       ["type","tag","text"].iter().cloned().collect()),
+        ("ElementVisibility", ["type","show","hide"].iter().cloned().collect()),
+        ("TitleSlide",        ["type","text"].iter().cloned().collect()),
+        ("ImportMarkdown",    ["type","tag","file"].iter().cloned().collect()),
+        ("Animation",         ["type"].iter().cloned().collect()),
+        ("ArrowVisibility",   ["type","tags","begin","end"].iter().cloned().collect()),
+        ("ShapeAttributes",   ["type","tags","shape","fill_color","stroke_color","stroke_style","text","font_size"].iter().cloned().collect()),
+        ("EdgeAttributes",    ["type","tags","text","color","line_style","thickness","font_color","font_size","text_background","text_border_color","start_arrow","end_arrow"].iter().cloned().collect()),
+        ("EmbedImage",        ["type","tag","file","width","height"].iter().cloned().collect()),
+    ].iter().cloned().collect();
+
+    // Known top-level config fields.
+    let known_config: HashSet<&str> = ["derived","delay_between_slides","heading_margin_bottom","list_item_spacing","list_item_indent","transition","transition_duration_ms","confluence"].iter().cloned().collect();
+
+    // Known fields inside each `derived` entry.
+    let known_derived: HashSet<&str> = ["output","from","transforms","bounding_box_tag","delay"].iter().cloned().collect();
+
+    let value: serde_yaml::Value = match serde_yaml::from_str(content) {
+        Ok(v) => v,
+        Err(_) => return, // already caught by the typed parse
+    };
+
+    // Check top-level config fields.
+    if let Some(map) = value.as_mapping() {
+        for key in map.keys() {
+            if let Some(k) = key.as_str() {
+                if !known_config.contains(k) {
+                    eprintln!(
+                        "Error in {}: unknown top-level field '{}'\n\
+                         Known fields: {}",
+                        yaml_file, k,
+                        {
+                            let mut v: Vec<&&str> = known_config.iter().collect();
+                            v.sort();
+                            v.iter().map(|s| **s).collect::<Vec<_>>().join(", ")
+                        }
+                    );
+                    process::exit(1);
+                }
+            }
+        }
+    }
+
+    let derived_list = match value.get("derived").and_then(|v| v.as_sequence()) {
+        Some(seq) => seq,
+        None => return,
+    };
+
+    for (step_i, step) in derived_list.iter().enumerate() {
+        let step_label = step
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+
+        // Check derived entry fields.
+        if let Some(map) = step.as_mapping() {
+            for key in map.keys() {
+                if let Some(k) = key.as_str() {
+                    if !known_derived.contains(k) {
+                        eprintln!(
+                            "Error in {} step {} ('{}'): unknown field '{}'\n\
+                             Known fields for a derived entry: {}",
+                            yaml_file, step_i + 1, step_label, k,
+                            {
+                                let mut v: Vec<&&str> = known_derived.iter().collect();
+                                v.sort();
+                                v.iter().map(|s| **s).collect::<Vec<_>>().join(", ")
+                            }
+                        );
+                        process::exit(1);
+                    }
+                }
+            }
+        }
+
+        let transforms = match step.get("transforms").and_then(|v| v.as_sequence()) {
+            Some(seq) => seq,
+            None => continue,
+        };
+
+        for (t_i, transform) in transforms.iter().enumerate() {
+            let type_name = transform
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+
+            let allowed = match known.get(type_name) {
+                Some(set) => set,
+                None => {
+                    eprintln!(
+                        "Error in {} step {} ('{}'), transform {}: unknown transform type '{}'\n\
+                         Known types: {}",
+                        yaml_file, step_i + 1, step_label, t_i + 1, type_name,
+                        {
+                            let mut names: Vec<&&str> = known.keys().collect();
+                            names.sort();
+                            names.iter().map(|s| **s).collect::<Vec<_>>().join(", ")
+                        }
+                    );
+                    process::exit(1);
+                }
+            };
+
+            if let Some(map) = transform.as_mapping() {
+                for key in map.keys() {
+                    if let Some(k) = key.as_str() {
+                        if !allowed.contains(k) {
+                            eprintln!(
+                                "Error in {} step {} ('{}'), transform {} ({}): unknown field '{}'\n\
+                                 Known fields for {}: {}",
+                                yaml_file, step_i + 1, step_label, t_i + 1, type_name, k,
+                                type_name,
+                                {
+                                    let mut v: Vec<&&str> = allowed.iter().collect();
+                                    v.sort();
+                                    v.iter().map(|s| **s).collect::<Vec<_>>().join(", ")
+                                }
+                            );
+                            process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn is_title_slide(derived: &model::Derived) -> bool {
@@ -152,6 +302,7 @@ fn generate_section_gif(
         list_item_spacing,
         list_item_indent,
         config_dir,
+        None, // no page number on animation frames
     )?;
     frame_pngs.push(frame0_png);
 
@@ -181,6 +332,7 @@ fn generate_section_gif(
             list_item_spacing,
             list_item_indent,
             config_dir,
+            None, // no page number on animation frames
         )?;
 
         // Track the final XML (after all transforms) for the caller.
@@ -206,10 +358,11 @@ fn generate_section_gif(
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Parse arguments: mandatory <config.yaml>, optional --step <output>, --no-confluence
+    // Parse arguments: mandatory <config.yaml>, optional --step <output>, --no-confluence, --dirty
     let mut yaml_arg: Option<&str> = None;
     let mut step_filter: Option<&str> = None;
     let mut no_confluence = false;
+    let mut dirty = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -224,6 +377,9 @@ fn main() {
             "--no-confluence" => {
                 no_confluence = true;
             }
+            "--dirty" => {
+                dirty = true;
+            }
             arg if !arg.starts_with('-') => {
                 yaml_arg = Some(arg);
             }
@@ -236,9 +392,14 @@ fn main() {
     }
 
     let yaml_arg = yaml_arg.unwrap_or_else(|| {
-        eprintln!("Usage: {} <config.yaml> [--step <output>] [--no-confluence]", args[0]);
+        eprintln!("Usage: {} <config.yaml> [--step <output>] [--no-confluence] [--dirty]", args[0]);
         process::exit(1);
     });
+
+    if dirty && step_filter.is_none() {
+        eprintln!("Error: --dirty requires --step");
+        process::exit(1);
+    }
 
     let yaml_path = Path::new(yaml_arg);
 
@@ -246,6 +407,8 @@ fn main() {
         eprintln!("Error reading {}: {}", yaml_path.display(), e);
         process::exit(1);
     });
+
+    validate_unknown_fields(&content, yaml_arg);
 
     let mut config: Config = serde_yaml::from_str(&content).unwrap_or_else(|e| {
         eprintln!("Error parsing YAML: {}", e);
@@ -310,13 +473,13 @@ fn main() {
     // after the main loop and pushed to Confluence.
     let mut section_gif_paths: Vec<std::path::PathBuf> = Vec::new();
 
-    // Intermediate per-step PNGs and section GIFs/MP4s go into <base>.tmp/.
+    // Per-step PNGs and section GIFs/MP4s go into sandbox-<stem>/.
     // The final GIF, MP4, and HTML stay in the directory of the config file.
     let out_dir = yaml_path
         .parent()
         .unwrap_or(Path::new("."))
         .join(format!(
-            "{}.tmp",
+            "sandbox-{}",
             yaml_path.file_stem().unwrap_or_default().to_string_lossy()
         ));
     fs::create_dir_all(&out_dir).unwrap_or_else(|e| {
@@ -363,11 +526,27 @@ fn main() {
         })
         .collect();
 
-    for derived in &config.derived {
-        let from_key = derived.from.as_deref().unwrap_or_else(|| {
-            eprintln!("Internal error: 'from' not resolved for step '{}'", derived.output);
-            process::exit(1);
-        });
+    let total_pages = config.derived.len();
+
+    for (page_idx, derived) in config.derived.iter().enumerate() {
+        let is_target = step_filter.map_or(true, |s| s == derived.output);
+
+        // In dirty mode, skip all non-target steps entirely — no transform, no
+        // cache update.  The target step runs directly on the root source XML.
+        if dirty && !is_target {
+            continue;
+        }
+
+        let from_key = if dirty && is_target {
+            // Bypass the dependency chain: use the step's own 'from' source directly
+            // (which may be an explicit file or the root source file).
+            derived.from.as_deref().unwrap_or(&source_file as &str)
+        } else {
+            derived.from.as_deref().unwrap_or_else(|| {
+                eprintln!("Internal error: 'from' not resolved for step '{}'", derived.output);
+                process::exit(1);
+            })
+        };
 
         // Load from file if not already in cache (e.g., when 'from' points to an
         // external .drawio file that is not the root source).
@@ -395,8 +574,6 @@ fn main() {
 
         let png_path = out_dir.join(format!("{}.png", strip_drawio_ext(&derived.output)));
 
-        let is_target = step_filter.map_or(true, |s| s == derived.output);
-
         let stem = Path::new(&derived.output)
             .file_stem()
             .unwrap_or_default()
@@ -408,7 +585,7 @@ fn main() {
         if !is_target && stored_digests.get(&derived.output) == Some(&current_hash) && png_path.exists() {
             println!("Unchanged {}", png_path.display());
             let out_xml =
-                transform::transform(from_xml, derived, &tmp_drawio, &png_path, Some(ref_size), config.heading_margin_bottom, config.list_item_spacing, config.list_item_indent, config_dir)
+                transform::transform(from_xml, derived, &tmp_drawio, &png_path, Some(ref_size), config.heading_margin_bottom, config.list_item_spacing, config.list_item_indent, config_dir, Some((page_idx + 1, total_pages)))
                     .unwrap_or_else(|e| {
                         eprintln!("Error transforming into {}: {}", derived.output, e);
                         process::exit(1);
@@ -418,7 +595,7 @@ fn main() {
             continue;
         }
 
-        let out_xml = transform::transform(from_xml, derived, &tmp_drawio, &png_path, Some(ref_size), config.heading_margin_bottom, config.list_item_spacing, config.list_item_indent, config_dir)
+        let out_xml = transform::transform(from_xml, derived, &tmp_drawio, &png_path, Some(ref_size), config.heading_margin_bottom, config.list_item_spacing, config.list_item_indent, config_dir, Some((page_idx + 1, total_pages)))
             .unwrap_or_else(|e| {
                 eprintln!("Error transforming into {}: {}", derived.output, e);
                 process::exit(1);

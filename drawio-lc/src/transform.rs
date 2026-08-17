@@ -15,6 +15,8 @@ use crate::model::{Derived, Transform};
 /// delete the temporary drawio file.
 /// Returns the transformed XML so the caller can keep it in memory for
 /// chained steps.
+/// `page_number` — if `Some((n, total))`, a "n / total" label is injected
+/// into the lower-right corner of every generated slide.
 pub fn transform(
     input_xml: &str,
     derived: &Derived,
@@ -25,26 +27,65 @@ pub fn transform(
     list_item_spacing: u32,
     list_item_indent: u32,
     config_dir: &Path,
+    page_number: Option<(usize, usize)>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let xml = apply_transforms(input_xml, &derived.transforms, ref_size, heading_margin_bottom, list_item_spacing, list_item_indent, config_dir)?;
 
-    if let Some(parent) = drawio_path.parent() {
+    // Build the export XML: add the page number only for the PNG export so it
+    // never leaks into the chained XML returned to the caller.
+    let export_xml = if let (Some((n, total)), Some((w, h))) = (page_number, ref_size) {
+        // When a bounding_box_tag is set, position the page number inside that
+        // cell's coordinate space so it stays visible after cropping.
+        let (origin_x, origin_y, container_w, container_h) =
+            if let Some(tag) = derived.bounding_box_tag.as_deref() {
+                if let Ok(Some(r)) = find_tagged_cell_geometry(&xml, tag) {
+                    (r.x as i64, r.y as i64, r.w as u32, r.h as u32)
+                } else {
+                    (0, 0, w, h)
+                }
+            } else {
+                (0, 0, w, h)
+            };
+        inject_page_number(&xml, n, total, origin_x, origin_y, container_w, container_h)
+    } else {
+        xml.clone()
+    };
+
+    // Write the temp drawio file in config_dir (alongside the YAML and source
+    // images) so that relative image paths in EmbedImage styles resolve
+    // correctly when draw.io's Electron CLI loads the file.
+    let drawio_filename = drawio_path
+        .file_name()
+        .ok_or("invalid drawio_path: no filename")?;
+    let local_drawio_path = config_dir.join(drawio_filename);
+
+    if let Some(parent) = local_drawio_path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
 
-    let mut file = fs::File::create(drawio_path)?;
-    file.write_all(xml.as_bytes())?;
+    let mut file = fs::File::create(&local_drawio_path)?;
+    file.write_all(export_xml.as_bytes())?;
 
-    export_png(drawio_path, png_path, ref_size)?;
+    // If bounding_box_tag is set, export at natural scale (no size constraint)
+    // so diagram units map 1:1 to pixels, then crop to the tagged cell.
+    // Otherwise export at ref_size for a consistent canvas.
+    if let Some(tag) = derived.bounding_box_tag.as_deref() {
+        export_png(&local_drawio_path, png_path, None)?;
+        let actual_size = {
+            use image::GenericImageView;
+            image::open(png_path)?.dimensions()
+        };
+        crop_png_to_tag(&export_xml, tag, png_path, actual_size.0, actual_size.1)?;
+    } else {
+        export_png(&local_drawio_path, png_path, ref_size)?;
+    }
 
-    fs::remove_file(drawio_path).unwrap_or_else(|e| {
-        eprintln!(
-            "Warning: could not remove temp file {}: {}",
-            drawio_path.display(),
-            e
-        );
+    // Write a debug copy before deletion
+    let _ = fs::copy(&local_drawio_path, "/tmp/debug_locust.drawio");
+    fs::remove_file(&local_drawio_path).unwrap_or_else(|_e| {
+        // file already gone — ignore
     });
 
     Ok(xml)
@@ -128,6 +169,92 @@ fn export_png(drawio_path: &Path, png_path: &Path, size: Option<(u32, u32)>) -> 
     }
 }
 
+/// Minimal base64 encoder — no external dependency needed.
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 { out.push(TABLE[((n >> 6) & 0x3f) as usize] as char); } else { out.push('='); }
+        if chunk.len() > 2 { out.push(TABLE[(n & 0x3f) as usize] as char); } else { out.push('='); }
+    }
+    out
+}
+
+/// Pre-process all EmbedImage transforms: read each image file, encode it,
+/// and build two maps:
+/// - `tag_to_style`: tag id → the full `image=data:…` style value to inject
+/// - `tag_to_geom`:  tag id → resolved (width, height) for mxGeometry patching
+///
+/// Draw.io's style parser splits on `;`, so a normal `data:image/png;base64,…`
+/// URI would be truncated.  The fix mirrors what draw.io's own GUI does when
+/// embedding images: strip the `;base64` encoding marker so the URI becomes
+/// `data:image/png,<base64_bytes>` — no semicolons, safe for the style parser.
+/// Browsers accept this form because base64 chars are all URL-safe.
+fn build_embed_info(
+    transforms: &[Transform],
+    config_dir: &Path,
+) -> Result<(HashMap<String, String>, HashMap<String, (Option<f64>, Option<f64>)>), Box<dyn std::error::Error>> {
+    // file_path → (style_uri, image pixel dimensions)  — dedup by file
+    let mut file_cache: HashMap<String, (String, Option<(u32, u32)>)> = HashMap::new();
+    let mut tag_to_style: HashMap<String, String> = HashMap::new();
+    let mut tag_to_geom:  HashMap<String, (Option<f64>, Option<f64>)> = HashMap::new();
+
+    for t in transforms {
+        if let Transform::EmbedImage { tag, file, width, height } = t {
+            let (style_uri, actual_dims) = if let Some(cached) = file_cache.get(file.as_str()) {
+                cached.clone()
+            } else {
+                let path = config_dir.join(file);
+                let img_bytes = fs::read(&path)
+                    .map_err(|e| format!("EmbedImage: could not read {:?}: {}", path, e))?;
+                let ext = path.extension()
+                    .and_then(|e| e.to_str()).unwrap_or("png").to_ascii_lowercase();
+                let mime = match ext.as_str() {
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "gif"          => "image/gif",
+                    "svg"          => "image/svg+xml",
+                    _              => "image/png",
+                };
+                // Strip the ";base64" encoding marker: `data:image/png;base64,XXX`
+                // → `data:image/png,XXX`.  This removes the only `;` in the URI
+                // so draw.io's semicolon-based style parser sees a single token.
+                // Browsers render `data:image/png,<base64>` correctly because
+                // all base64 characters are URL-safe.
+                let uri = format!("data:{},{}", mime, base64_encode(&img_bytes));
+                let dims = image::load_from_memory(&img_bytes).ok().map(|i| i.dimensions());
+                let entry = (uri, dims);
+                file_cache.insert(file.clone(), entry.clone());
+                entry
+            };
+            tag_to_style.insert(tag.clone(), style_uri);
+
+            let (w_out, h_out) = match (*width, *height) {
+                (Some(w), Some(h)) => (Some(w), Some(h)),
+                (Some(w), None) => {
+                    let h = actual_dims.map(|(aw, ah)| w * ah as f64 / aw as f64);
+                    (Some(w), h)
+                }
+                (None, Some(h)) => {
+                    let w = actual_dims.map(|(aw, ah)| h * aw as f64 / ah as f64);
+                    (w, Some(h))
+                }
+                (None, None) => (
+                    actual_dims.map(|(w, _)| w as f64),
+                    actual_dims.map(|(_, h)| h as f64),
+                ),
+            };
+            tag_to_geom.insert(tag.clone(), (w_out, h_out));
+        }
+    }
+    Ok((tag_to_style, tag_to_geom))
+}
+
 /// Walk the XML stream and apply every transform in order, returning the
 /// modified XML string.
 fn apply_transforms(
@@ -171,6 +298,9 @@ fn apply_transforms(
     // Resolve all id-or-tag references in transforms to concrete cell ids.
     let resolved_transforms = resolve_transforms(transforms, &tag_to_id);
 
+    // Pre-process EmbedImage transforms: encode each image and build style maps.
+    let (embed_tag_to_style, embed_tag_to_geom) = build_embed_info(&resolved_transforms, config_dir)?;
+
     let mut reader = Reader::from_str(input_xml);
     reader.config_mut().trim_text(false);
 
@@ -205,12 +335,12 @@ fn apply_transforms(
 
             // mxCell — patch using its own id, or its parent UserObject's id.
             Event::Start(elem) if elem.name().as_ref() == b"mxCell" => {
-                let (patched, geom) = patch_cell_with_geometry(elem, &resolved_transforms, &edge_ids_to_recolor, heading_margin_bottom, list_item_spacing, list_item_indent, user_object_id.as_deref(), config_dir)?;
+                let (patched, geom) = patch_cell_with_geometry(elem, &resolved_transforms, &edge_ids_to_recolor, heading_margin_bottom, list_item_spacing, list_item_indent, user_object_id.as_deref(), config_dir, &embed_tag_to_style, &embed_tag_to_geom)?;
                 pending_geometry = geom;
                 writer.write_event(Event::Start(patched))?;
             }
             Event::Empty(elem) if elem.name().as_ref() == b"mxCell" => {
-                let (patched, geom) = patch_cell_with_geometry(elem, &resolved_transforms, &edge_ids_to_recolor, heading_margin_bottom, list_item_spacing, list_item_indent, user_object_id.as_deref(), config_dir)?;
+                let (patched, geom) = patch_cell_with_geometry(elem, &resolved_transforms, &edge_ids_to_recolor, heading_margin_bottom, list_item_spacing, list_item_indent, user_object_id.as_deref(), config_dir, &embed_tag_to_style, &embed_tag_to_geom)?;
                 pending_geometry = geom;
                 writer.write_event(Event::Empty(patched))?;
             }
@@ -231,7 +361,8 @@ fn apply_transforms(
         }
     }
 
-    Ok(String::from_utf8(writer.into_inner())?)
+    let xml = String::from_utf8(writer.into_inner())?;
+    Ok(xml)
 }
 
 /// Convert Markdown text to an HTML string escaped for use inside an XML
@@ -389,11 +520,12 @@ fn resolve_transforms(
             begin: *begin,
             end: *end,
         },
-        Transform::ShapeAttributes { tags, shape, fill_color, stroke_color, text, font_size } => Transform::ShapeAttributes {
+        Transform::ShapeAttributes { tags, shape, fill_color, stroke_color, stroke_style, text, font_size } => Transform::ShapeAttributes {
             tags: expand_list(tags),
             shape: shape.clone(),
             fill_color: fill_color.clone(),
             stroke_color: stroke_color.clone(),
+            stroke_style: stroke_style.clone(),
             text: text.clone(),
             font_size: *font_size,
         },
@@ -419,6 +551,43 @@ fn resolve_transforms(
         // TitleSlide and Animation don't reference cell ids.
         other => other.clone(),
     }).collect()
+}
+
+/// Inject a page-number label (`n / total`) into the lower-right corner of
+/// an already-transformed drawio XML string.  The cell is placed 8 px from
+/// the right and bottom edges of the canvas, sized 120 × 30 px.
+/// Inject a page-number label (`n / total`) into the lower-right corner of
+/// the given rectangle `(origin_x, origin_y, w, h)` in diagram coordinates.
+/// The cell is placed `margin` px from the right and bottom edges.
+fn inject_page_number(
+    xml: &str,
+    n: usize,
+    total: usize,
+    origin_x: i64,
+    origin_y: i64,
+    canvas_w: u32,
+    canvas_h: u32,
+) -> String {
+    let cell_w: u32 = 120;
+    let cell_h: u32 = 30;
+    let margin: u32 = 8;
+    let x = origin_x + (canvas_w.saturating_sub(cell_w + margin)) as i64;
+    let y = origin_y + (canvas_h.saturating_sub(cell_h + margin)) as i64;
+    let cell = format!(
+        r#"<mxCell id="page-number" parent="1" value="{n} / {total}" vertex="1" style="text;html=1;align=right;verticalAlign=middle;fontSize=14;fontColor=#888888;strokeColor=none;fillColor=none;"><mxGeometry x="{x}" y="{y}" width="{w}" height="{h}" as="geometry"/></mxCell>"#,
+        n = n,
+        total = total,
+        x = x,
+        y = y,
+        w = cell_w,
+        h = cell_h,
+    );
+    // Insert just before </root> so it sits on top of all other cells.
+    if let Some(pos) = xml.rfind("</root>") {
+        format!("{}{}{}", &xml[..pos], cell, &xml[pos..])
+    } else {
+        xml.to_string()
+    }
 }
 
 /// Generate a minimal drawio XML containing only a centered text label,
@@ -814,6 +983,8 @@ fn patch_cell_with_geometry(
     list_item_indent: u32,
     user_object_id: Option<&str>,
     config_dir: &Path,
+    embed_tag_to_style: &HashMap<String, String>,
+    embed_tag_to_geom: &HashMap<String, (Option<f64>, Option<f64>)>,
 ) -> Result<(BytesStart<'static>, Option<(Option<f64>, Option<f64>)>), Box<dyn std::error::Error>> {
     let mut attrs: Vec<(Vec<u8>, Vec<u8>)> = elem
         .attributes()
@@ -908,7 +1079,7 @@ fn patch_cell_with_geometry(
             }
 
             // --- ShapeAttributes ---
-            Transform::ShapeAttributes { tags, shape, fill_color, stroke_color, text, font_size }
+            Transform::ShapeAttributes { tags, shape, fill_color, stroke_color, stroke_style, text, font_size }
                 if tags.contains(&id) =>
             {
                 if let Some(s) = shape {
@@ -919,6 +1090,21 @@ fn patch_cell_with_geometry(
                 }
                 if let Some(c) = stroke_color {
                     patch_style_token_in_attrs(&mut attrs, "strokeColor", c);
+                }
+                if let Some(ss) = stroke_style {
+                    use crate::model::StrokeStyle;
+                    match ss {
+                        StrokeStyle::Solid => {
+                            patch_style_token_in_attrs(&mut attrs, "dashed", "0");
+                        }
+                        StrokeStyle::Dashed => {
+                            patch_style_token_in_attrs(&mut attrs, "dashed", "1");
+                        }
+                        StrokeStyle::Dotted => {
+                            patch_style_token_in_attrs(&mut attrs, "dashed", "1");
+                            patch_style_token_in_attrs(&mut attrs, "dashPattern", "1 4");
+                        }
+                    }
                 }
                 if let Some(fs) = font_size {
                     patch_style_token_in_attrs(&mut attrs, "fontSize", &fs.to_string());
@@ -999,49 +1185,25 @@ fn patch_cell_with_geometry(
         }
     }
 
-    // Handle EmbedImage: update style to a data URI and collect geometry changes.
+    // Handle EmbedImage: embed the image data URI directly in the style.
+    // The URI uses `data:image/png,<base64>` format (no `;base64` marker) so
+    // draw.io's semicolon-based style parser sees a single `image=…` token
+    // with no embedded semicolons.  This mirrors what draw.io's own GUI does
+    // when images are pasted into the editor (EditorUi.js ~line 11720).
     let mut pending_geom: Option<(Option<f64>, Option<f64>)> = None;
-    for t in transforms {
-        if let Transform::EmbedImage { tag, file, width, height } = t {
-            if tag == &id {
-                let path = config_dir.join(file);
-                let img_bytes = fs::read(&path).map_err(|e| {
-                    format!("EmbedImage: could not read {:?}: {}", path, e)
-                })?;
-                use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
-                let mime = if file.ends_with(".png") { "image/png" }
-                    else if file.ends_with(".jpg") || file.ends_with(".jpeg") { "image/jpeg" }
-                    else { "image/png" };
-                let data_uri = format!("data:{};base64,{}", mime, b64);
-                // Replace the style with an image style using the data URI.
-                let new_style = format!("shape=image;verticalLabelPosition=bottom;labelBackgroundColor=#ffffff;verticalAlign=top;align=center;strokeColor=none;fillColor=none;image;image={};", data_uri);
-                if let Some((_, val)) = attrs.iter_mut().find(|(k, _)| k == b"style") {
-                    *val = new_style.into_bytes();
-                } else {
-                    attrs.push((b"style".to_vec(), new_style.into_bytes()));
-                }
-                // Determine final width/height by loading actual image dimensions.
-                let actual = image::load_from_memory(&img_bytes).ok().map(|i| i.dimensions());
-                let (w_out, h_out) = match (*width, *height) {
-                    (Some(w), Some(h)) => (Some(w), Some(h)),
-                    (Some(w), None) => {
-                        let h = actual.map(|(aw, ah)| w * ah as f64 / aw as f64);
-                        (Some(w), h)
-                    }
-                    (None, Some(h)) => {
-                        let w = actual.map(|(aw, ah)| h * aw as f64 / ah as f64);
-                        (w, Some(h))
-                    }
-                    (None, None) => (
-                        actual.map(|(w, _)| w as f64),
-                        actual.map(|(_, h)| h as f64),
-                    ),
-                };
-                pending_geom = Some((w_out, h_out));
-                break;
-            }
+    if let Some(data_uri) = embed_tag_to_style.get(&id) {
+        let new_style = format!(
+            "shape=image;verticalLabelPosition=bottom;labelBackgroundColor=#ffffff;\
+             verticalAlign=top;align=center;strokeColor=none;fillColor=none;\
+             image={};",
+            data_uri
+        );
+        if let Some((_, val)) = attrs.iter_mut().find(|(k, _)| k == b"style") {
+            *val = new_style.into_bytes();
+        } else {
+            attrs.push((b"style".to_vec(), new_style.into_bytes()));
         }
+        pending_geom = embed_tag_to_geom.get(&id).copied();
     }
 
     let name = String::from_utf8_lossy(elem.name().as_ref()).into_owned();
@@ -1052,7 +1214,12 @@ fn patch_cell_with_geometry(
     Ok((new_elem, pending_geom))
 }
 
-/// Patch the `width` and/or `height` attributes of an `mxGeometry` element.
+/// Patch the `width`, `height`, `x`, and `y` attributes of an `mxGeometry`
+/// element so that the image is centred on the original placeholder's centre.
+///
+/// Original placeholder: top-left at (orig_x, orig_y), size orig_w × orig_h.
+/// New image size: new_w × new_h.
+/// New top-left: orig_x + orig_w/2 − new_w/2, orig_y + orig_h/2 − new_h/2.
 fn patch_geometry(
     elem: BytesStart,
     width: Option<f64>,
@@ -1063,14 +1230,31 @@ fn patch_geometry(
         .filter_map(|a| a.ok())
         .map(|a| (a.key.as_ref().to_vec(), a.value.to_vec()))
         .collect();
+
+    // Read original x, y, width, height for centre-alignment.
+    let parse = |key: &[u8]| -> Option<f64> {
+        attrs.iter()
+            .find(|(k, _)| k.as_slice() == key)
+            .and_then(|(_, v)| std::str::from_utf8(v).ok())
+            .and_then(|s| s.parse::<f64>().ok())
+    };
+    let orig_x = parse(b"x").unwrap_or(0.0);
+    let orig_y = parse(b"y").unwrap_or(0.0);
+    let orig_w = parse(b"width").unwrap_or(0.0);
+    let orig_h = parse(b"height").unwrap_or(0.0);
+
     if let Some(w) = width {
-        if let Some(entry) = attrs.iter_mut().find(|(k, _)| k == b"width") {
-            entry.1 = format!("{}", w).into_bytes();
+        let new_x = orig_x + orig_w / 2.0 - w / 2.0;
+        for (k, v) in attrs.iter_mut() {
+            if k == b"width"  { *v = format!("{}", w).into_bytes(); }
+            if k == b"x"      { *v = format!("{}", new_x).into_bytes(); }
         }
     }
     if let Some(h) = height {
-        if let Some(entry) = attrs.iter_mut().find(|(k, _)| k == b"height") {
-            entry.1 = format!("{}", h).into_bytes();
+        let new_y = orig_y + orig_h / 2.0 - h / 2.0;
+        for (k, v) in attrs.iter_mut() {
+            if k == b"height" { *v = format!("{}", h).into_bytes(); }
+            if k == b"y"      { *v = format!("{}", new_y).into_bytes(); }
         }
     }
     let name = String::from_utf8_lossy(elem.name().as_ref()).into_owned();
@@ -1208,6 +1392,287 @@ fn patch_stroke_color(style: &str, color: &str) -> String {
             format!("{};strokeColor={};", style, color)
         }
     }
+}
+
+/// A rectangle in XML diagram coordinates.
+#[derive(Debug, Clone, Copy)]
+struct Rect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// Walk the XML and collect the bounding box of all **visible** vertex cells.
+/// Cells with `visible="0"` on their `mxCell` element (or their parent
+/// `UserObject`/`object` wrapper) are excluded.
+/// Returns `None` if no visible geometry is found.
+fn compute_diagram_bbox(xml: &str) -> Result<Option<Rect>, Box<dyn std::error::Error>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut min_x = f64::MAX;
+    let mut min_y = f64::MAX;
+    let mut max_x = f64::MIN;
+    let mut max_y = f64::MIN;
+    let mut found = false;
+
+    // Track whether the current wrapper/mxCell is hidden.
+    let mut wrapper_hidden = false;
+    let mut cell_hidden = false;
+
+    loop {
+        match reader.read_event()? {
+            Event::Eof => break,
+
+            Event::Start(ref elem) if is_cell_wrapper(elem.name().as_ref()) => {
+                wrapper_hidden = elem.attributes().filter_map(|a| a.ok())
+                    .any(|a| a.key.as_ref() == b"visible" && a.value.as_ref() == b"0");
+            }
+            Event::End(ref elem) if is_cell_wrapper(elem.name().as_ref()) => {
+                wrapper_hidden = false;
+            }
+
+            Event::Start(ref elem) | Event::Empty(ref elem)
+                if elem.name().as_ref() == b"mxCell" =>
+            {
+                cell_hidden = wrapper_hidden
+                    || elem.attributes().filter_map(|a| a.ok())
+                        .any(|a| a.key.as_ref() == b"visible" && a.value.as_ref() == b"0");
+            }
+
+            Event::Empty(ref elem) if elem.name().as_ref() == b"mxGeometry" => {
+                if cell_hidden {
+                    continue;
+                }
+                let mut x: f64 = 0.0;
+                let mut y: f64 = 0.0;
+                let mut w: f64 = 0.0;
+                let mut h: f64 = 0.0;
+                let mut is_geometry = false;
+                for attr in elem.attributes().filter_map(|a| a.ok()) {
+                    match attr.key.as_ref() {
+                        b"as"     => { is_geometry = attr.value.as_ref() == b"geometry"; }
+                        b"x"      => { x = String::from_utf8_lossy(&attr.value).parse().unwrap_or(0.0); }
+                        b"y"      => { y = String::from_utf8_lossy(&attr.value).parse().unwrap_or(0.0); }
+                        b"width"  => { w = String::from_utf8_lossy(&attr.value).parse().unwrap_or(0.0); }
+                        b"height" => { h = String::from_utf8_lossy(&attr.value).parse().unwrap_or(0.0); }
+                        _ => {}
+                    }
+                }
+                if is_geometry && w > 0.0 && h > 0.0 {
+                    if x         < min_x { min_x = x; }
+                    if y         < min_y { min_y = y; }
+                    if x + w     > max_x { max_x = x + w; }
+                    if y + h     > max_y { max_y = y + h; }
+                    found = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if found {
+        Ok(Some(Rect { x: min_x, y: min_y, w: max_x - min_x, h: max_y - min_y }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Find the `mxGeometry` of the first cell whose `tags` attribute contains
+/// `tag`.  Searches both `UserObject`/`object` wrapper elements (tag on
+/// wrapper, geometry on inner mxCell) and bare `mxCell` elements.
+fn find_tagged_cell_geometry(
+    xml: &str,
+    tag: &str,
+) -> Result<Option<Rect>, Box<dyn std::error::Error>> {
+    // Build tag→id map first (reuse existing helper logic inline).
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+
+    // Step 1: collect id of the first cell with the target tag.
+    let mut target_id: Option<String> = None;
+    loop {
+        match reader.read_event()? {
+            Event::Eof => break,
+            Event::Start(ref elem) | Event::Empty(ref elem)
+                if is_cell_wrapper(elem.name().as_ref()) =>
+            {
+                let mut id = None;
+                let mut tags: Option<String> = None;
+                for attr in elem.attributes().filter_map(|a| a.ok()) {
+                    match attr.key.as_ref() {
+                        b"id" => id = String::from_utf8(attr.value.to_vec()).ok(),
+                        b"tags" => tags = String::from_utf8(attr.value.to_vec()).ok(),
+                        _ => {}
+                    }
+                }
+                if let (Some(id), Some(tags_str)) = (id, tags) {
+                    if tags_str.split(',').map(str::trim).any(|t| t == tag) {
+                        target_id = Some(id);
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let target_id = match target_id {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+
+    // Step 2: find the mxGeometry of the mxCell whose id OR parent id matches.
+    let mut reader2 = Reader::from_str(xml);
+    reader2.config_mut().trim_text(false);
+    let mut current_parent_id: Option<String> = None;
+    loop {
+        match reader2.read_event()? {
+            Event::Eof => break,
+            Event::Start(ref elem) if is_cell_wrapper(elem.name().as_ref()) => {
+                let id = elem.attributes().filter_map(|a| a.ok())
+                    .find(|a| a.key.as_ref() == b"id")
+                    .and_then(|a| String::from_utf8(a.value.to_vec()).ok());
+                current_parent_id = id;
+            }
+            Event::End(ref elem) if is_cell_wrapper(elem.name().as_ref()) => {
+                current_parent_id = None;
+            }
+            Event::Start(ref elem) | Event::Empty(ref elem)
+                if elem.name().as_ref() == b"mxCell" =>
+            {
+                // A cell matches if its own id equals target_id, OR if it is
+                // the inner mxCell of a UserObject whose id is target_id.
+                let mut cell_id = None;
+                for attr in elem.attributes().filter_map(|a| a.ok()) {
+                    if attr.key.as_ref() == b"id" {
+                        cell_id = String::from_utf8(attr.value.to_vec()).ok();
+                    }
+                }
+                let matches = cell_id.as_deref() == Some(&target_id)
+                    || current_parent_id.as_deref() == Some(&target_id);
+                if matches {
+                    // Now scan forward for the sibling/child mxGeometry.
+                    // For a UserObject, the geometry is in the inner mxCell's
+                    // child mxGeometry — so we need to keep reading.
+                }
+            }
+            Event::Empty(ref elem) if elem.name().as_ref() == b"mxGeometry" => {
+                // Check if we are inside the target cell.
+                // The parent mxCell was already identified by current_parent_id.
+                // We rely on the fact that mxGeometry is a child of mxCell.
+                // Re-scan more carefully: we need to know whether the immediately
+                // preceding mxCell matched.  Track a flag instead.
+                let _ = elem; // handled below via a second pass
+            }
+            _ => {}
+        }
+    }
+
+    // Simpler two-pass: collect (cell_id, Option<parent_wrapper_id>) → geometry.
+    let mut reader3 = Reader::from_str(xml);
+    reader3.config_mut().trim_text(false);
+    let mut wrapper_id: Option<String> = None;
+    let mut in_target_cell = false;
+    loop {
+        match reader3.read_event()? {
+            Event::Eof => break,
+            Event::Start(ref elem) if is_cell_wrapper(elem.name().as_ref()) => {
+                let id = elem.attributes().filter_map(|a| a.ok())
+                    .find(|a| a.key.as_ref() == b"id")
+                    .and_then(|a| String::from_utf8(a.value.to_vec()).ok());
+                wrapper_id = id;
+            }
+            Event::End(ref elem) if is_cell_wrapper(elem.name().as_ref()) => {
+                wrapper_id = None;
+                in_target_cell = false;
+            }
+            Event::Start(ref elem) | Event::Empty(ref elem)
+                if elem.name().as_ref() == b"mxCell" =>
+            {
+                let cell_id: Option<String> = elem.attributes().filter_map(|a| a.ok())
+                    .find(|a| a.key.as_ref() == b"id")
+                    .and_then(|a| String::from_utf8(a.value.to_vec()).ok());
+                in_target_cell = cell_id.as_deref() == Some(&target_id)
+                    || wrapper_id.as_deref() == Some(&target_id);
+            }
+            Event::Empty(ref elem) if elem.name().as_ref() == b"mxGeometry" && in_target_cell => {
+                let mut x = 0.0f64;
+                let mut y = 0.0f64;
+                let mut w = 0.0f64;
+                let mut h = 0.0f64;
+                for attr in elem.attributes().filter_map(|a| a.ok()) {
+                    match attr.key.as_ref() {
+                        b"x" => x = String::from_utf8_lossy(&attr.value).parse().unwrap_or(0.0),
+                        b"y" => y = String::from_utf8_lossy(&attr.value).parse().unwrap_or(0.0),
+                        b"width"  => w = String::from_utf8_lossy(&attr.value).parse().unwrap_or(0.0),
+                        b"height" => h = String::from_utf8_lossy(&attr.value).parse().unwrap_or(0.0),
+                        _ => {}
+                    }
+                }
+                return Ok(Some(Rect { x, y, w, h }));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+/// Crop the PNG at `png_path` in-place to the region of the cell tagged
+/// `tag`, using the diagram bounding box to map XML coordinates → pixels.
+///
+/// Draw.io exports the full content bounding box; the default border is 0.
+/// With `--width W --height H` the canvas is scaled to fit, preserving AR.
+/// Since we pass exactly `(png_w, png_h) == ref_size == natural export size`,
+/// scale ≈ 1.0 and the border accounts for 1 extra pixel on each side.
+fn crop_png_to_tag(
+    xml: &str,
+    tag: &str,
+    png_path: &Path,
+    png_w: u32,
+    png_h: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cell_rect = match find_tagged_cell_geometry(xml, tag)? {
+        Some(r) => r,
+        None => {
+            return Err(format!(
+                "bounding_box_tag '{}' not found in XML — check that the tag exists in the source .drawio file",
+                tag
+            ).into());
+        }
+    };
+    let diagram_bbox = match compute_diagram_bbox(xml)? {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    // Draw.io adds a 1px border by default when exporting.
+    let border: f64 = 1.0;
+    let scale_x = (png_w as f64 - 2.0 * border) / diagram_bbox.w;
+    let scale_y = (png_h as f64 - 2.0 * border) / diagram_bbox.h;
+
+    // Map cell rect from XML coords to PNG pixel coords.
+    let px_x = ((cell_rect.x - diagram_bbox.x) * scale_x + border).round() as i64;
+    let px_y = ((cell_rect.y - diagram_bbox.y) * scale_y + border).round() as i64;
+    let px_w = (cell_rect.w * scale_x).round() as u32;
+    let px_h = (cell_rect.h * scale_y).round() as u32;
+
+    // Clamp to the actual PNG dimensions.
+    let px_x = px_x.max(0) as u32;
+    let px_y = px_y.max(0) as u32;
+    let px_w = px_w.min(png_w.saturating_sub(px_x));
+    let px_h = px_h.min(png_h.saturating_sub(px_y));
+
+    if px_w == 0 || px_h == 0 {
+        return Err(format!(
+            "bounding_box_tag '{}' maps to a zero-size region — the tagged cell may have no geometry",
+            tag
+        ).into());
+    }
+
+    let img = image::open(png_path)?;
+    let cropped = img.crop_imm(px_x, px_y, px_w, px_h);
+    cropped.save(png_path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1426,5 +1891,24 @@ mod tests {
         let style = "html=1;rounded=0;";
         let result = patch_style_token(style, "startArrow", "none");
         assert_eq!(result, "html=1;rounded=0;startArrow=none;");
+    }
+
+    #[test]
+    fn find_tagged_cell_geometry_finds_wrapper_cell() {
+        let xml = r#"<mxfile><diagram><mxGraphModel><root>
+<mxCell id="0"/><mxCell id="1" parent="0"/>
+<object label="" tags="cadre1" id="J34ETNXcT7p5jXkDUDWP-21">
+  <mxCell parent="1" style="rounded=0" vertex="1">
+    <mxGeometry height="650" width="850" x="30" y="-120" as="geometry" />
+  </mxCell>
+</object>
+</root></mxGraphModel></diagram></mxfile>"#;
+        let result = find_tagged_cell_geometry(xml, "cadre1").unwrap();
+        assert!(result.is_some(), "should find cadre1 geometry");
+        let r = result.unwrap();
+        assert_eq!(r.x, 30.0);
+        assert_eq!(r.y, -120.0);
+        assert_eq!(r.w, 850.0);
+        assert_eq!(r.h, 650.0);
     }
 }

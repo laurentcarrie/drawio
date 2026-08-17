@@ -23,6 +23,14 @@ pub struct Config {
     /// box edge. Defaults to 0 (no indent).
     #[serde(default = "default_list_item_indent")]
     pub list_item_indent: u32,
+    /// Transition effect applied between slides in the MP4 output.
+    /// Supported values: "dissolve". Omit for a hard cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<String>,
+    /// Duration of the transition effect in milliseconds. Only used when
+    /// `transition` is set. Defaults to 500 ms.
+    #[serde(default = "default_transition_duration_ms")]
+    pub transition_duration_ms: u32,
     /// Optional: if present, the generated slides are pushed to Confluence.
     pub confluence: Option<ConfluenceConfig>,
 }
@@ -37,6 +45,10 @@ fn default_heading_margin_bottom() -> u32 {
 
 fn default_list_item_spacing() -> u32 {
     0
+}
+
+fn default_transition_duration_ms() -> u32 {
+    500
 }
 
 fn default_list_item_indent() -> u32 {
@@ -73,6 +85,18 @@ pub struct Derived {
     /// GIF/MP4.  Overrides `delay_between_slides` for this specific slide.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay: Option<u32>,
+}
+
+/// Border/stroke line style for shape cells.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StrokeStyle {
+    /// Continuous line (draw.io: `dashed=0`).
+    Solid,
+    /// Dashed line (draw.io: `dashed=1`).
+    Dashed,
+    /// Dotted line (draw.io: `dashed=1; dashPattern=1 4`).
+    Dotted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +160,9 @@ pub enum Transform {
         /// Stroke (border) color as a CSS hex string.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stroke_color: Option<String>,
+        /// Border line style: "solid", "dashed", or "dotted".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stroke_style: Option<StrokeStyle>,
         /// Replace the cell label with this text (Markdown supported).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,

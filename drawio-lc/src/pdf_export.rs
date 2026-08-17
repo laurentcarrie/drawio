@@ -3,8 +3,8 @@ use std::{fs, io::BufWriter, path::Path};
 use printpdf::{Image, ImageTransform, Mm, PdfDocument};
 
 /// Build a PDF where every PNG in `png_paths` becomes one page.
-/// Each page is sized to the PNG's pixel dimensions converted to mm at 96 dpi,
-/// and the image is placed to fill the whole page.
+/// Each page is sized to match its PNG's pixel dimensions at 96 dpi,
+/// so every slide preserves its aspect ratio exactly.
 pub fn build_pdf(
     png_paths: &[&Path],
     output_path: &Path,
@@ -13,45 +13,48 @@ pub fn build_pdf(
         return Err("No PNG frames provided for PDF export".into());
     }
 
-    // Read the first image to get the reference dimensions for the document.
-    let first_bytes = fs::read(png_paths[0])
-        .map_err(|e| format!("Failed to read {}: {}", png_paths[0].display(), e))?;
-    let (ref_w_px, ref_h_px) = png_dimensions(&first_bytes)?;
-
     // Convert pixel dimensions to mm at 96 dpi.
     let px_to_mm = |px: u32| -> f32 { px as f32 / 96.0 * 25.4 };
-    let page_w_mm = px_to_mm(ref_w_px);
-    let page_h_mm = px_to_mm(ref_h_px);
+
+    // Bootstrap the document with the first page's dimensions.
+    let first_bytes = fs::read(png_paths[0])
+        .map_err(|e| format!("Failed to read {}: {}", png_paths[0].display(), e))?;
+    let (first_w_px, first_h_px) = png_dimensions(&first_bytes)?;
 
     let (doc, first_page, first_layer) = PdfDocument::new(
         "Slides",
-        Mm(page_w_mm),
-        Mm(page_h_mm),
+        Mm(px_to_mm(first_w_px)),
+        Mm(px_to_mm(first_h_px)),
         "Layer 1",
     );
 
     for (i, png_path) in png_paths.iter().enumerate() {
+        let bytes = if i == 0 {
+            first_bytes.clone()
+        } else {
+            fs::read(png_path)
+                .map_err(|e| format!("Failed to read {}: {}", png_path.display(), e))?
+        };
+
+        let (w_px, h_px) = png_dimensions(&bytes)?;
+        let page_w_mm = px_to_mm(w_px);
+        let page_h_mm = px_to_mm(h_px);
+
         let layer = if i == 0 {
             doc.get_page(first_page).get_layer(first_layer)
         } else {
-            let (page_idx, layer_idx) =
-                doc.add_page(Mm(page_w_mm), Mm(page_h_mm), "Layer 1");
+            let (page_idx, layer_idx) = doc.add_page(Mm(page_w_mm), Mm(page_h_mm), "Layer 1");
             doc.get_page(page_idx).get_layer(layer_idx)
         };
 
-        let bytes = fs::read(png_path)
-            .map_err(|e| format!("Failed to read {}: {}", png_path.display(), e))?;
-
-        let (w_px, h_px) = png_dimensions(&bytes)?;
-
-        // printpdf places images at 300 dpi by default.
-        // Scale factors to fill the page exactly: page_mm / (px / 300 * 25.4).
+        // Scale the image to fill its page exactly.
+        // Because page and image share the same pixel dimensions this is
+        // always a 1:1 mapping — scale_x == scale_y, ratio is preserved.
         let img_w_mm_at_300dpi = w_px as f32 / 300.0 * 25.4;
         let img_h_mm_at_300dpi = h_px as f32 / 300.0 * 25.4;
         let scale_x = page_w_mm / img_w_mm_at_300dpi;
         let scale_y = page_h_mm / img_h_mm_at_300dpi;
 
-        // Use printpdf's bundled image crate to decode the PNG.
         let mut cursor = std::io::Cursor::new(&bytes);
         let decoder = printpdf::image_crate::codecs::png::PngDecoder::new(&mut cursor)?;
         let image = Image::try_from(decoder)?;
