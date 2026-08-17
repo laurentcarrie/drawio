@@ -27,7 +27,7 @@ step:
 	cargo run --manifest-path drawio-lc/Cargo.toml -- $(YAML) --step $(step) --no-confluence $(if $(dirty),--dirty,)
 
 play: $(OUTDIR)/$(STEM).mp4
-	mpv --hwdec=no --vf=scale=426:616 $(OUTDIR)/$(STEM).mp4
+	mpv --hwdec=no --vf=scale=426:616 $(STEM).mp4
 
 confluence:
 	cargo run --manifest-path drawio-lc/Cargo.toml -- $(YAML)

@@ -2,6 +2,7 @@ mod confluence_export;
 mod gif_export;
 mod html_export;
 mod model;
+mod pdf_export;
 mod transform;
 
 use std::{collections::HashMap, env, fs, path::Path, process};
@@ -539,6 +540,13 @@ fn main() {
         process::exit(1);
     });
     println!("Generated {}", html_path.display());
+
+    let pdf_path = yaml_stem.with_extension("pdf");
+    pdf_export::build_pdf(&png_path_refs, &pdf_path).unwrap_or_else(|e| {
+        eprintln!("Error building PDF: {}", e);
+        process::exit(1);
+    });
+    println!("Generated {}", pdf_path.display());
 
     // Optionally push slides to Confluence if configured and not suppressed.
     if !no_confluence {

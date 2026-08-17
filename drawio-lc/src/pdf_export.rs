@@ -1,54 +1,86 @@
-use printpdf::image_crate::GenericImageView;
-use printpdf::*;
-use std::fs::File;
-use std::io::BufWriter;
-use std::path::Path;
+use std::{fs, io::BufWriter, path::Path};
 
-/// Build a PDF with one page per slide.
-/// Each PNG is placed on a page sized to match the image at 96 dpi.
-pub fn build_pdf(png_paths: &[&Path], pdf_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+use printpdf::{Image, ImageTransform, Mm, PdfDocument};
+
+/// Build a PDF where every PNG in `png_paths` becomes one page.
+/// Each page is sized to the PNG's pixel dimensions converted to mm at 96 dpi,
+/// and the image is placed to fill the whole page.
+pub fn build_pdf(
+    png_paths: &[&Path],
+    output_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     if png_paths.is_empty() {
-        return Err("no slides to export".into());
+        return Err("No PNG frames provided for PDF export".into());
     }
 
-    // Screen resolution assumed when none is embedded in the PNG.
-    const DPI: f32 = 96.0;
+    // Read the first image to get the reference dimensions for the document.
+    let first_bytes = fs::read(png_paths[0])
+        .map_err(|e| format!("Failed to read {}: {}", png_paths[0].display(), e))?;
+    let (ref_w_px, ref_h_px) = png_dimensions(&first_bytes)?;
 
-    let px_to_mm = |px: u32| -> Mm { Mm((px as f32 * 25.4 / DPI) as f32) };
+    // Convert pixel dimensions to mm at 96 dpi.
+    let px_to_mm = |px: u32| -> f32 { px as f32 / 96.0 * 25.4 };
+    let page_w_mm = px_to_mm(ref_w_px);
+    let page_h_mm = px_to_mm(ref_h_px);
 
-    // Helper: load a PNG and return (printpdf Image, width_mm, height_mm).
-    let load = |path: &Path| -> Result<(Image, Mm, Mm), Box<dyn std::error::Error>> {
-        let dyn_img = printpdf::image_crate::open(path)?;
-        let (w_px, h_px) = dyn_img.dimensions();
-        let img = Image::from_dynamic_image(&dyn_img);
-        Ok((img, px_to_mm(w_px), px_to_mm(h_px)))
-    };
+    let (doc, first_page, first_layer) = PdfDocument::new(
+        "Slides",
+        Mm(page_w_mm),
+        Mm(page_h_mm),
+        "Layer 1",
+    );
 
-    let (first_img, first_w, first_h) = load(png_paths[0])?;
+    for (i, png_path) in png_paths.iter().enumerate() {
+        let layer = if i == 0 {
+            doc.get_page(first_page).get_layer(first_layer)
+        } else {
+            let (page_idx, layer_idx) =
+                doc.add_page(Mm(page_w_mm), Mm(page_h_mm), "Layer 1");
+            doc.get_page(page_idx).get_layer(layer_idx)
+        };
 
-    let (doc, first_page_idx, first_layer_idx) =
-        PdfDocument::new("Slides", first_w, first_h, "Layer 1");
+        let bytes = fs::read(png_path)
+            .map_err(|e| format!("Failed to read {}: {}", png_path.display(), e))?;
 
-    let add_image = |img: Image, layer: PdfLayerReference| {
-        img.add_to_layer(
+        let (w_px, h_px) = png_dimensions(&bytes)?;
+
+        // printpdf places images at 300 dpi by default.
+        // Scale factors to fill the page exactly: page_mm / (px / 300 * 25.4).
+        let img_w_mm_at_300dpi = w_px as f32 / 300.0 * 25.4;
+        let img_h_mm_at_300dpi = h_px as f32 / 300.0 * 25.4;
+        let scale_x = page_w_mm / img_w_mm_at_300dpi;
+        let scale_y = page_h_mm / img_h_mm_at_300dpi;
+
+        // Use printpdf's bundled image crate to decode the PNG.
+        let mut cursor = std::io::Cursor::new(&bytes);
+        let decoder = printpdf::image_crate::codecs::png::PngDecoder::new(&mut cursor)?;
+        let image = Image::try_from(decoder)?;
+
+        image.add_to_layer(
             layer,
             ImageTransform {
                 translate_x: Some(Mm(0.0)),
                 translate_y: Some(Mm(0.0)),
-                dpi: Some(DPI),
-                ..Default::default()
+                scale_x: Some(scale_x),
+                scale_y: Some(scale_y),
+                rotate: None,
+                dpi: Some(300.0),
             },
         );
-    };
-
-    add_image(first_img, doc.get_page(first_page_idx).get_layer(first_layer_idx));
-
-    for path in &png_paths[1..] {
-        let (img, w, h) = load(path)?;
-        let (page_idx, layer_idx) = doc.add_page(w, h, "Layer 1");
-        add_image(img, doc.get_page(page_idx).get_layer(layer_idx));
     }
 
-    doc.save(&mut BufWriter::new(File::create(pdf_path)?))?;
+    let file = fs::File::create(output_path)?;
+    doc.save(&mut BufWriter::new(file))?;
     Ok(())
+}
+
+/// Extract width and height in pixels from raw PNG bytes without a full decode.
+fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+    // PNG header: 8-byte signature + IHDR chunk (4 len + 4 "IHDR" + 4 w + 4 h + ...)
+    if bytes.len() < 24 {
+        return Err("PNG file too short".into());
+    }
+    let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    Ok((w, h))
 }
