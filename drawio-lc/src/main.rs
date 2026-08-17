@@ -47,6 +47,14 @@ fn validate_config(config: &Config) {
     }
 }
 
+/// Strip the `.drawio` extension from an output name, keeping all other dots.
+/// e.g. "step6.scenario.drawio" → "step6.scenario"
+///      "step1.drawio"          → "step1"
+///      "step1"                 → "step1"
+fn strip_drawio_ext(output: &str) -> &str {
+    output.strip_suffix(".drawio").unwrap_or(output)
+}
+
 fn is_title_slide(derived: &model::Derived) -> bool {
     derived.transforms.len() == 1
         && matches!(derived.transforms[0], model::Transform::TitleSlide { .. })
@@ -301,6 +309,20 @@ fn main() {
     // after the main loop and pushed to Confluence.
     let mut section_gif_paths: Vec<std::path::PathBuf> = Vec::new();
 
+    // Intermediate per-step PNGs and section GIFs/MP4s go into <base>.tmp/.
+    // The final GIF, MP4, and HTML stay in the directory of the config file.
+    let out_dir = yaml_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!(
+            "{}.tmp",
+            yaml_path.file_stem().unwrap_or_default().to_string_lossy()
+        ));
+    fs::create_dir_all(&out_dir).unwrap_or_else(|e| {
+        eprintln!("Error creating output dir {}: {}", out_dir.display(), e);
+        process::exit(1);
+    });
+
     // Use a temp directory for intermediate .drawio files; only PNGs are kept.
     let tmp_dir = std::env::temp_dir().join("drawio-lc");
     fs::create_dir_all(&tmp_dir).unwrap_or_else(|e| {
@@ -370,7 +392,7 @@ fn main() {
         hasher.update(from_xml.as_bytes());
         let current_hash = hex::encode(hasher.finalize());
 
-        let png_path = Path::new(&derived.output).with_extension("png");
+        let png_path = out_dir.join(format!("{}.png", strip_drawio_ext(&derived.output)));
 
         let is_target = step_filter.map_or(true, |s| s == derived.output);
 
@@ -409,8 +431,11 @@ fn main() {
             let sections = split_transform_sections(&derived.transforms);
             let mut section_xml = from_xml.to_string();
             for (sec_idx, section) in sections.iter().enumerate() {
-                let gif_path = Path::new(&derived.output)
-                    .with_extension(format!("section{}.gif", sec_idx + 1));
+                let gif_path = out_dir.join(format!(
+                    "{}.section{}.gif",
+                    strip_drawio_ext(&derived.output),
+                    sec_idx + 1
+                ));
                 let result = generate_section_gif(
                     &section_xml,
                     section,
@@ -482,7 +507,7 @@ fn main() {
     let png_paths: Vec<_> = config
         .derived
         .iter()
-        .map(|d| Path::new(&d.output).with_extension("png"))
+        .map(|d| out_dir.join(format!("{}.png", strip_drawio_ext(&d.output))))
         .collect();
     let png_path_refs: Vec<&Path> = png_paths.iter().map(|p| p.as_path()).collect();
     let slide_delays: Vec<u32> = config
